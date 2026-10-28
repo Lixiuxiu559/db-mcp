@@ -1,0 +1,31 @@
+config.yaml
+.env
+*.pem
+audit/
+# 审计数据库及 SQLite WAL / SHM / journal 文件（含目录外的默认文件名）
+audit.db
+audit.db-*
+*.db
+*.db-*
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+
+# 运行时数据与密钥（目录持久化，不入库）
+data/
+runtime/
+keys/
+
+# MCP 接入配置（含 token）
+.mcp.json
+
+# 系统
+.DS_Store

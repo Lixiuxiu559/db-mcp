@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.git/
+config.yaml
+.env
+audit/
+webui/node_modules/
+Dockerfile
+docker-compose.yml
+.dockerignore

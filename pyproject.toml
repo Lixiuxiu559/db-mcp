@@ -1,0 +1,43 @@
+[project]
+name = "db-mcp"
+version = "0.1.0"
+description = "团队共享数据库网关 MCP 服务：集中托管 PostgreSQL / Redis 实例凭据，按实例分级读写权限"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastmcp>=4.0.3,<5",
+    # asyncpg：当前性能最好的 asyncio PostgreSQL 驱动，原生支持连接池与只读事务
+    "asyncpg>=0.29,<1",
+    # redis-py 的 asyncio 支持（redis.asyncio），内置连接池
+    "redis>=5.0,<7",
+    "pyyaml>=6.0.1",
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+]
+
+[project.scripts]
+db-mcp = "db_mcp.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=1.0",
+    "httpx2>=2.5.0",
+    "ruff>=0.12",
+]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.12"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# B008: fastmcp 依赖注入的官方写法就是参数默认值调用（Depends(...)/CurrentContext()）
+ignore = ["B008"]

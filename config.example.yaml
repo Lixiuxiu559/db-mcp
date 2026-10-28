@@ -1,0 +1,75 @@
+# db-mcp 配置文件样例。复制为 config.yaml 后修改。
+# 密码/token 建议用 ${ENV_VAR} 引用环境变量（缺变量时启动会直接报错）；
+# $$ 表示字面 $。
+
+server:
+  host: 0.0.0.0
+  port: 8807
+
+auth:
+  # 未配置任何用户时，服务启用内置默认管理员 admin/admin（引导账号，
+  # 启动日志会提示）；配置了用户后默认账号自动失效。
+  users:
+    - username: alice
+      token: ${DBMCP_TOKEN_ALICE}
+      admin: true          # admin 可在网页上增删改配置与成员
+    - username: bob
+      token: ${DBMCP_TOKEN_BOB}
+
+audit:
+  path: audit/audit.db     # SQLite 审计库
+  retention_days: 30       # 只保留最近 30 天，超期记录自动清理
+  max_statement_chars: 4000  # 审计里单条 SQL/命令的最大记录长度，超出截断
+
+limits:
+  connect_timeout_seconds: 10
+  query_timeout_seconds: 60        # 单次查询/命令的最长执行时间
+  max_query_timeout_seconds: 600   # 工具参数可请求的上限
+  # 一次查询最多返回的行数 / Redis 集合类命令最多返回的元素数
+  max_rows: 1000
+  max_result_chars: 50000          # 返回给 LLM 的文本上限，超出截断并提示收窄条件
+  max_pool_size: 5                 # 每个实例的连接池上限
+  max_concurrency_per_instance: 8  # 每个实例的并发操作上限
+
+instances:
+  # PostgreSQL 实例示例
+  pg-main:
+    type: postgres
+    host: 10.0.0.30
+    port: 5432
+    database: appdb
+    user: app_readonly
+    password: ${DBMCP_PG_MAIN_PASSWORD}
+    permissions: read        # read | write
+    enabled: true
+    # schema: public         # 默认 schema（list_tables/describe_table 缺省用）
+
+  pg-ops:
+    type: postgres
+    host: 10.0.0.30
+    port: 5432
+    database: appdb
+    user: app_ops
+    password: ${DBMCP_PG_OPS_PASSWORD}
+    permissions: write
+    enabled: true
+
+  # Redis 实例示例
+  redis-cache:
+    type: redis
+    host: 10.0.0.40
+    port: 6379
+    password: ${DBMCP_REDIS_PASSWORD}
+    database: 0              # 逻辑库编号 0-15
+    permissions: read
+    enabled: true
+
+  # redis-acl:
+  #   type: redis
+  #   host: 10.0.0.40
+  #   port: 6380
+  #   username: app            # Redis 6+ ACL 用户名
+  #   password: ${DBMCP_REDIS_ACL_PASSWORD}
+  #   database: 1
+  #   permissions: write
+  #   enabled: false         # 设为 false 可临时禁用

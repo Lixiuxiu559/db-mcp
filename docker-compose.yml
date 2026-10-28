@@ -1,0 +1,35 @@
+# db-mcp 容器部署。
+# 用法：
+#   DOCKER_UID=$(id -u) DOCKER_GID=$(id -g) docker compose up -d --build
+# 说明：DOCKER_UID/GID 必须与宿主上 config.yaml / audit/ 的属主一致，
+#       否则容器内的管理端无法写配置（网页增删改实例会失败）。
+
+services:
+  db-mcp:
+    build: .
+    image: db-mcp:latest
+    container_name: db-mcp
+    restart: unless-stopped
+
+    # 以宿主用户身份运行，保证挂载卷可读写
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+
+    ports:
+      - "8807:8807"
+    # 管理端会写 config.yaml、审计写 audit/ —— 两者都必须可写挂载。
+    # 注意必须挂「目录」而非单个文件：配置保存走原子写（先写 .tmp 再 rename），
+    # 单文件 bind mount 会让临时文件与目标落在不同文件系统上，rename 必然失败。
+    volumes:
+      - ./:/data
+
+    # 配置里的 ${VAR} 引用从这里注入（比在 config.yaml 里写明文密码更安全）
+    environment:
+      TZ: Asia/Shanghai
+      DBMCP_TOKEN_ALICE: ${DBMCP_TOKEN_ALICE:-}
+      DBMCP_TOKEN_BOB: ${DBMCP_TOKEN_BOB:-}
+      # 数据库密码也用环境变量注入，例如：
+      # DBMCP_PG_MAIN_PASSWORD: ${DBMCP_PG_MAIN_PASSWORD:-}
+
+    # 数据库若不在容器可达网络，用 extra_hosts 或自定义 network 处理
+    # extra_hosts:
+    #   - "pg.internal:10.0.0.30"
