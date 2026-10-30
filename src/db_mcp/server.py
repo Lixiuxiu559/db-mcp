@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from fastmcp import FastMCP
-from fastmcp.server.auth import StaticTokenVerifier
 from fastmcp.server.lifespan import lifespan
 
 from .audit import AuditMiddleware
-from .config import ConfigFile, GatewayConfig
+from .auth import StoreTokenVerifier
+from .config import ConfigFile
 from .state import DbState
 from .tools import inventory, postgres, redis
 from .web.api import register_web_routes
@@ -29,31 +29,25 @@ INSTRUCTIONS = (
 )
 
 
-def build_token_verifier(config: GatewayConfig) -> StaticTokenVerifier:
-    """token -> 用户名 的静态映射，MCP 请求凭 Bearer token 认证。"""
-    tokens = {
-        user.token.get_secret_value(): {"client_id": user.username}
-        for user in config.auth.users
-    }
-    return StaticTokenVerifier(tokens=tokens)
-
-
 def create_mcp(cfg_file: ConfigFile) -> tuple[FastMCP, DbState]:
     state = DbState(cfg_file)
 
     @lifespan
     async def _app_lifespan(server: FastMCP):
-        yield {"state": state}
-        await state.shutdown()
+        await state.startup()
+        try:
+            yield {"state": state}
+        finally:
+            await state.shutdown()
 
     mcp = FastMCP(
         name="db-mcp",
         instructions=INSTRUCTIONS,
-        auth=build_token_verifier(state.config),
+        auth=StoreTokenVerifier(state.identity, state.audit),
         lifespan=_app_lifespan,
         mask_error_details=True,
     )
-    mcp.add_middleware(AuditMiddleware(state.audit))
+    mcp.add_middleware(AuditMiddleware(state.audit, state))
     inventory.register(mcp)
     postgres.register(mcp)
     redis.register(mcp)

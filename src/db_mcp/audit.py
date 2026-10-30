@@ -1,240 +1,451 @@
-"""审计：SQLite 存储 + 统一的工具调用中间件。
-
-决策回顾：仅审计、不拦截。每次工具调用记一条。
-
-与 ssh-mcp 的差异：本服务**记录 SQL / Redis 命令明文**（超长截断），
-因为排查数据库问题必须知道"执行的到底是什么语句"。语句里可能含业务数据，
-但管理端仅 admin 可见，且导出需 admin token。密码等凭据绝不入库。
-"""
+"""人员操作与 MCP 调用审计：独立身份、目标快照、30 天保留和旧记录兼容。"""
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
+import json
+import logging
+import os
+import re
 import sqlite3
 import threading
 import time
+import uuid
+import weakref
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.dependencies import get_access_token, get_http_request
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
-_PRUNE_INTERVAL_SECONDS = 3600  # 清理节流：最多每小时一次
+_LOG = logging.getLogger(__name__)
+_MAX_TEXT = 16_384
+_SECRET_KEYS = re.compile(
+    r"password|passwd|passphrase|secret|private_key|authorization|^token$|session", re.IGNORECASE
+)
+_SECRET_ARG = re.compile(
+    r"(?i)((?:--)?(?:password|passwd|passphrase|token|secret|api[_-]?key|authorization)"
+    r"\s*(?:[:=]\s*|\s+))(?:\"[^\"]*\"|'[^']*'|[^\s;,]+)"
+)
+_CALL = contextvars.ContextVar("db_mcp_audit_call", default=None)
+_CANCELLED_TASKS: weakref.WeakSet = weakref.WeakSet()
 
-_FIELDS = (
+
+def _has_pending_cancellation() -> bool:
+    task = asyncio.current_task()
+    if task is None:
+        return False
+    cancelling = getattr(task, "cancelling", None)
+    # Task.cancelling() is unavailable on Python 3.10. Remember cancellation
+    # caught by an audit write without retaining completed task objects.
+    return bool(cancelling()) if callable(cancelling) else task in _CANCELLED_TASKS
+
+
+def raise_if_cancelled() -> None:
+    """审计兜底写入不能允许已取消请求继续连接或执行外部操作。"""
+    if _has_pending_cancellation():
+        raise asyncio.CancelledError()
+
+_MCP_FIELDS = (
+    "id", "ts", "ended_at", "service_id", "user", "token_id", "token_name", "token_prefix",
+    "tool", "instance", "kind", "target_type", "target_host", "target_port", "target_database",
+    "target_username", "statement", "statement_truncated", "row_count", "result_truncated",
+    "request_id", "source_ip", "status", "duration_ms", "error", "legacy_id",
+)
+_PERSON_FIELDS = (
+    "event_id",
     "ts",
-    "user",
-    "tool",
-    "instance",
-    "kind",
-    "statement",
-    "statement_truncated",
-    "row_count",
-    "request_id",
+    "service_id",
+    "actor_user_id",
+    "username",
+    "action",
+    "object_type",
+    "object_id",
+    "summary",
     "status",
-    "duration_ms",
     "error",
+    "request_id",
+    "source_ip",
 )
-
-_SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS audit_records (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    {_FIELDS[0]}   TEXT NOT NULL,
-    {_FIELDS[1]}   TEXT,
-    {_FIELDS[2]}   TEXT,
-    {_FIELDS[3]}   TEXT,
-    {_FIELDS[4]}   TEXT,
-    {_FIELDS[5]}   TEXT,
-    {_FIELDS[6]}   INTEGER,
-    {_FIELDS[7]}   INTEGER,
-    {_FIELDS[8]}   TEXT,
-    {_FIELDS[9]}   TEXT,
-    {_FIELDS[10]}  REAL,
-    {_FIELDS[11]}  TEXT
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS mcp_calls (
+ id TEXT PRIMARY KEY, ts TEXT NOT NULL, ended_at TEXT, service_id TEXT,
+ user TEXT, token_id TEXT, token_name TEXT, token_prefix TEXT,
+ tool TEXT, instance TEXT, kind TEXT, target_type TEXT, target_host TEXT, target_port INTEGER,
+ target_database TEXT, target_username TEXT, statement TEXT, statement_truncated INTEGER DEFAULT 0,
+ row_count INTEGER, result_truncated INTEGER DEFAULT 0, request_id TEXT, source_ip TEXT,
+ status TEXT, duration_ms REAL, error TEXT, legacy_id INTEGER UNIQUE
 );
-CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_records(ts);
-CREATE INDEX IF NOT EXISTS idx_audit_instance ON audit_records(instance);
+CREATE INDEX IF NOT EXISTS idx_calls_ts ON mcp_calls(ts);
+CREATE INDEX IF NOT EXISTS idx_calls_token ON mcp_calls(token_id,ts);
+CREATE INDEX IF NOT EXISTS idx_calls_instance ON mcp_calls(instance,ts);
+CREATE TABLE IF NOT EXISTS person_events (
+ event_id TEXT PRIMARY KEY, ts TEXT NOT NULL, service_id TEXT,
+ actor_user_id TEXT, username TEXT, action TEXT, object_type TEXT, object_id TEXT,
+ summary TEXT, status TEXT, error TEXT, request_id TEXT, source_ip TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_person_ts ON person_events(ts);
+CREATE INDEX IF NOT EXISTS idx_person_actor ON person_events(actor_user_id,ts);
+CREATE TABLE IF NOT EXISTS mcp_attempts (
+ call_id TEXT NOT NULL, attempt INTEGER NOT NULL, ts TEXT NOT NULL,
+ ended_at TEXT, status TEXT, error TEXT, PRIMARY KEY(call_id,attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_attempts_ts ON mcp_attempts(ts);
+CREATE TABLE IF NOT EXISTS audit_migrations (name TEXT PRIMARY KEY);
 """
-
-_INSERT_SQL = (
-    f"INSERT INTO audit_records ({','.join(_FIELDS)}) "
-    f"VALUES ({','.join('?' * len(_FIELDS))})"
-)
-
-
-def current_user() -> str:
-    """当前认证用户（StaticTokenVerifier 的 client_id），取不到则为 anonymous。"""
-    try:
-        token = get_access_token()
-        return token.client_id if token else "anonymous"
-    except Exception:  # noqa: BLE001 - 审计兜底：任何认证上下文异常都记为 anonymous
-        return "anonymous"
 
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-# Redis 工具名 -> 审计里展示的命令名，让审计读起来像真实 Redis 命令
-_REDIS_CMD_NAMES = {
-    "redis_get": "GET",
-    "redis_mget": "MGET",
-    "redis_set": "SET",
-    "redis_del": "DEL",
-    "redis_expire": "EXPIRE",
-    "redis_ttl": "TTL",
-    "redis_exists": "EXISTS",
-    "redis_type": "TYPE",
-    "redis_keys": "KEYS",
-    "redis_scan": "SCAN",
-    "redis_list_range": "LRANGE",
-    "redis_list_push": "RPUSH",
-    "redis_list_pop": "LPOP",
-    "redis_hash_get": "HGETALL",
-    "redis_hash_set": "HSET",
-    "redis_hash_del": "HDEL",
-    "redis_set_members": "SMEMBERS",
-    "redis_set_add": "SADD",
-    "redis_set_remove": "SREM",
-    "redis_zset_range": "ZRANGE",
-    "redis_zset_add": "ZADD",
-    "redis_zset_remove": "ZREM",
-}
+def _now() -> str:
+    return _utc_now().isoformat(timespec="milliseconds")
 
 
-def _statement_from_args(args: dict[str, Any]) -> str | None:
-    """从工具参数里拼出"人可读的语句"。"""
-    if isinstance(args.get("sql"), str):
-        return args["sql"]
-    if isinstance(args.get("command"), str):
-        return args["command"]
+def redact(value: Any, secrets: tuple[str, ...] = ()) -> Any:
+    """清除已知凭据和常见命名字段；不宣称可识别任意命令中的业务敏感值。"""
+    if isinstance(value, dict):
+        return {
+            str(k): "[已脱敏]" if _SECRET_KEYS.search(str(k)) else redact(v, secrets)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact(v, secrets) for v in value]
+    if not isinstance(value, str):
+        return value
+    text = value
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        if secret:
+            text = text.replace(secret, "[已脱敏]")
+    return _SECRET_ARG.sub(r"\1[已脱敏]", text)
 
-    tool = str(args.get("__tool__") or "")
-    cmd = _REDIS_CMD_NAMES.get(tool)
-    if cmd is None:
-        return None
-    # 展示成 `CMD <第一个非实例参数>` 的形态：GET user:1 / HSET user:1 / KEYS user:*
-    target = args.get("key") or args.get("pattern") or args.get("keys")
-    if target is None:
-        return cmd
-    return f"{cmd} {target}"
+
+def current_user() -> str:
+    try:
+        token = get_access_token()
+        return token.client_id if token else "anonymous"
+    except Exception:  # noqa: BLE001 - optional request context
+        return "anonymous"
 
 
 class AuditLogger:
-    """SQLite 审计日志：写入即落盘，按保留期自动清理，支持分页查询。"""
-
     def __init__(self, path: Path, retention_days: int = 30, max_statement_chars: int = 4000):
         self.path = Path(path)
         self.retention_days = max(1, retention_days)
-        self.max_statement_chars = max(64, max_statement_chars)
+        self.max_statement_chars = max(64, min(int(max_statement_chars), _MAX_TEXT))
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
-        self._last_prune = 0.0
+        self._lock = threading.RLock()
         self._conn: sqlite3.Connection | None = None
+        self._last_prune = 0.0
+        # Startup errors are visible. Runtime writes must never replace a tool result.
+        self.prune()
         with self._lock:
-            self._prune(force=True)
+            conn = self._connection()
+            conn.execute(
+                "UPDATE mcp_calls SET status='unknown',error=? WHERE status='running'",
+                ["服务重新启动时发现未完成调用；远端结果未知"],
+            )
+            conn.execute(
+                "UPDATE person_events SET status='unknown',error=? WHERE status='running'",
+                ["服务重新启动时发现未完成管理操作；结果未知"],
+            )
+            conn.execute(
+                "UPDATE mcp_attempts SET status='unknown',error=? WHERE status IN ('running','started')",
+                ["服务重新启动时发现未完成外部尝试；结果未知"],
+            )
+            conn.commit()
 
     def _connection(self) -> sqlite3.Connection:
-        """惰性建连：close 之后再次写入会自动重开（调用方需持有 self._lock）。"""
         if self._conn is None:
-            # check_same_thread=False + 显式加锁：允许在事件循环线程与 to_thread 间共用连接
-            conn = sqlite3.connect(self.path, check_same_thread=False)
+            # 首次创建先收紧权限，避免 WAL 含 SQL/身份数据却继承宽松 umask。
+            fd = os.open(self.path, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+            self.path.chmod(0o600)
+            self._secure_sidecars()
+            conn = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
             conn.row_factory = sqlite3.Row
-            conn.executescript(_SCHEMA)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.commit()
+            try:
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.executescript(_SCHEMA)
+                self._migrate_legacy(conn)
+                conn.commit()
+            except BaseException:
+                conn.close()
+                raise
             self._conn = conn
+            self._secure_sidecars()
         return self._conn
 
-    async def log(self, record: dict[str, Any]) -> None:
-        row = [record.get(name) for name in _FIELDS]
+    def _secure_sidecars(self) -> None:
+        for suffix in ("-wal", "-shm", "-journal"):
+            path = Path(str(self.path) + suffix)
+            if path.exists():
+                path.chmod(0o600)
+
+    @staticmethod
+    def _migrate_legacy(conn: sqlite3.Connection) -> None:
+        migrated = conn.execute("SELECT 1 FROM audit_migrations WHERE name='legacy-v1'").fetchone()
+        if migrated:
+            return
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_records'"
+        ).fetchone()
+        if exists:
+            for record in conn.execute("SELECT * FROM audit_records ORDER BY id").fetchall():
+                row = dict(record)
+                fields = {key: row.get(key) for key in _MCP_FIELDS}
+                fields.update(id=f"legacy-{row['id']}", legacy_id=row["id"], service_id="db-mcp")
+                fields["token_name"] = "历史记录（未记录 token 身份）"
+                fields["token_id"] = None
+                fields["status"] = row.get("status") or "unknown"
+                for key in ("statement", "error"):
+                    if fields.get(key):
+                        fields[key] = str(redact(fields[key]))[:_MAX_TEXT]
+                conn.execute(
+                    f"INSERT OR IGNORE INTO mcp_calls ({','.join(_MCP_FIELDS)}) "
+                    f"VALUES ({','.join('?' for _ in _MCP_FIELDS)})",
+                    [fields[key] for key in _MCP_FIELDS],
+                )
+        conn.execute("INSERT INTO audit_migrations(name) VALUES ('legacy-v1')")
+
+    def _write(self, table: str, key: str, fields: tuple[str, ...], record: dict[str, Any]) -> None:
+        updates = [name for name in fields if name != key and name in record]
+        chosen = [name for name in fields if name in record]
+        assignments = ",".join(f"{name}=excluded.{name}" for name in updates)
+        # Cancellation can leave an already submitted worker running. A delayed duplicate
+        # start marker must not turn a completed operation back into running.
+        conflict = "DO NOTHING" if table == "person_events" else (
+            f"DO UPDATE SET {assignments} "
+            "WHERE (excluded.status IS NOT 'running' OR mcp_calls.status='running') "
+            "AND (mcp_calls.status IS NOT 'cancelled' OR excluded.status='cancelled')"
+        )
         with self._lock:
-            self._connection().execute(_INSERT_SQL, row)
-            self._connection().commit()
+            conn = self._connection()
+            conn.execute(
+                f"INSERT INTO {table} ({','.join(chosen)}) VALUES ({','.join('?' for _ in chosen)}) "
+                f"ON CONFLICT({key}) {conflict}",
+                [record[name] for name in chosen],
+            )
+            conn.commit()
+            self._secure_sidecars()
             self._prune()
 
+    async def _safe_write(self, operation: Callable[[], None]) -> bool:
+        # Operations use stable primary keys. Cancellation fallback can race a worker safely.
+        try:
+            await asyncio.to_thread(operation)
+            return True
+        except asyncio.CancelledError:
+            task = asyncio.current_task()
+            if task is not None:
+                _CANCELLED_TASKS.add(task)
+            try:
+                operation()
+                return True
+            except Exception as exc:  # noqa: BLE001 - audit cannot replace business outcome
+                _LOG.error("审计取消兜底写入失败: %s", type(exc).__name__)
+                return False
+        except Exception as exc:  # noqa: BLE001 - audit cannot replace business outcome
+            _LOG.error("审计写入失败: %s", type(exc).__name__)
+            return False
+
+    def _prepare(self, record: dict[str, Any], person: bool = False) -> dict[str, Any]:
+        row = dict(record)
+        row.setdefault("ts", _now())
+        row.setdefault("service_id", "db-mcp")
+        row.setdefault("event_id" if person else "id", uuid.uuid4().hex)
+        for name in ("statement", "error", "summary"):
+            if name not in row or row[name] is None:
+                continue
+            text = row[name]
+            if isinstance(text, (dict, list)):
+                text = json.dumps(redact(text), ensure_ascii=False)
+            text = str(redact(str(text)))
+            maximum = self.max_statement_chars if name == "statement" else _MAX_TEXT
+            if name == "statement":
+                row["statement_truncated"] = int(len(text) > maximum or bool(row.get("statement_truncated")))
+            row[name] = text[:maximum]
+        return row
+
+    async def log(self, record: dict[str, Any]) -> None:
+        """兼容旧调用；使用稳定 ID 幂等落库。"""
+        row = self._prepare(record)
+        await self._safe_write(lambda: self._write("mcp_calls", "id", _MCP_FIELDS, row))
+
+    async def begin_call(self, record: dict[str, Any]) -> str:
+        row = self._prepare({**record, "status": "running"})
+        await self._safe_write(lambda: self._write("mcp_calls", "id", _MCP_FIELDS, row))
+        return row["id"]
+
+    async def finish_call(self, call_id: str, record: dict[str, Any]) -> None:
+        row = self._prepare({**record, "id": call_id})
+        row.setdefault("ended_at", _now())
+
+        # Do not overwrite start timestamp when only completing an existing call.
+        def complete():
+            with self._lock:
+                existing = (
+                    self._connection()
+                    .execute("SELECT ts FROM mcp_calls WHERE id=?", [call_id])
+                    .fetchone()
+                )
+                if existing:
+                    row["ts"] = existing["ts"]
+                self._write("mcp_calls", "id", _MCP_FIELDS, row)
+
+        await self._safe_write(complete)
+        if _has_pending_cancellation():
+            row.update(status="cancelled", error="请求已取消；数据库操作是否完成需另行核实")
+            await self._safe_write(complete)
+            raise asyncio.CancelledError()
+
+    async def log_person(self, record: dict[str, Any]) -> bool:
+        row = self._prepare(record, person=True)
+        row.setdefault("username", row.get("actor_username"))
+        return await self._safe_write(
+            lambda: self._write("person_events", "event_id", _PERSON_FIELDS, row)
+        )
+
+    async def begin_person(self, record: dict[str, Any]) -> bool:
+        """Persist a start marker before a non-transactional external side effect."""
+        row = self._prepare({**record, "status": "running"}, person=True)
+        return await self._safe_write(
+            lambda: self._write("person_events", "event_id", _PERSON_FIELDS, row)
+        )
+
+    async def finish_person(self, record: dict[str, Any]) -> bool:
+        """Complete only an existing start marker; never replace original timestamp."""
+        row = self._prepare(record, person=True)
+        fields = [key for key in _PERSON_FIELDS if key not in {"ts", "event_id"} and key in row]
+
+        def complete():
+            with self._lock:
+                conn = self._connection()
+                conn.execute(
+                    "UPDATE person_events SET "
+                    + ",".join(f"{key}=?" for key in fields)
+                    + " WHERE event_id=? AND status='running'",
+                    [row[key] for key in fields] + [row["event_id"]],
+                )
+                conn.commit()
+
+        return await self._safe_write(complete)
+
     def _prune(self, force: bool = False) -> None:
-        """删除超过保留期的记录；调用方需持有 self._lock。"""
-        now = time.monotonic()
-        if not force and now - self._last_prune < _PRUNE_INTERVAL_SECONDS:
-            return
+        with self._lock:
+            if not force and time.monotonic() - self._last_prune < 3600:
+                return
+            conn = self._connection()
+            cutoff = (_utc_now() - timedelta(days=self.retention_days)).isoformat(
+                timespec="milliseconds"
+            )
+            conn.execute(
+                "DELETE FROM mcp_attempts WHERE ts < ? "
+                "OR call_id IN (SELECT id FROM mcp_calls WHERE ts < ?)",
+                [cutoff, cutoff],
+            )
+            conn.execute("DELETE FROM mcp_calls WHERE ts < ?", [cutoff])
+            conn.execute("DELETE FROM person_events WHERE ts < ?", [cutoff])
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='audit_records'"
+            ).fetchone():
+                conn.execute("DELETE FROM audit_records WHERE ts < ?", [cutoff])
+            conn.commit()
+            self._last_prune = time.monotonic()
+
+    def prune(self) -> None:
+        """Public maintenance entry point, callable even without new traffic."""
+        self._prune(force=True)
+
+    def _filter_clause(
+        self, kind="mcp", instance=None, status=None, q=None, since=None, token_id=None, user_id=None
+    ):
+        if kind not in ("mcp", "person"):
+            raise ValueError("kind 必须是 mcp 或 person")
         cutoff = (_utc_now() - timedelta(days=self.retention_days)).isoformat(
             timespec="milliseconds"
         )
-        conn = self._connection()
-        conn.execute("DELETE FROM audit_records WHERE ts < ?", (cutoff,))
-        conn.commit()
-        self._last_prune = now
-
-    def _filter_clause(
-        self,
-        instance: str | None = None,
-        status: str | None = None,
-        q: str | None = None,
-        since: str | None = None,
-    ) -> tuple[str, list[Any]]:
-        """构造 WHERE 子句：实例 / 状态 / 关键词（语句·工具·用户）/ 时间下界。"""
-        where: list[str] = []
-        params: list[Any] = []
-        if instance:
-            where.append("instance = ?")
-            params.append(instance)
-        if status:
-            where.append("status = ?")
-            params.append(status)
-        if since:
-            where.append("ts >= ?")
-            params.append(since)
+        where, params = ["ts >= ?"], [max(cutoff, since) if since else cutoff]
+        filters = {"status": status}
+        if kind == "mcp":
+            filters.update(instance=instance, token_id=token_id)
+            search = ("statement", "tool", "user", "instance", "token_name", "target_host", "target_database")
+        else:
+            filters.update(actor_user_id=user_id)
+            search = ("username", "action", "object_type", "object_id", "summary")
+        for key, value in filters.items():
+            if value:
+                where.append(f"{key} = ?")
+                params.append(value)
         if q:
-            like = f"%{q}%"
-            where.append(
-                "(statement LIKE ? OR tool LIKE ? OR user LIKE ? OR instance LIKE ?)"
-            )
-            params.extend([like] * 4)
-        clause = f" WHERE {' AND '.join(where)}" if where else ""
-        return clause, params
+            where.append("(" + " OR ".join(f"{name} LIKE ?" for name in search) + ")")
+            params.extend([f"%{q}%"] * len(search))
+        return " WHERE " + " AND ".join(where), params
 
     def query(
         self,
-        limit: int = 20,
-        offset: int = 0,
-        instance: str | None = None,
-        status: str | None = None,
-        q: str | None = None,
-        since: str | None = None,
-    ) -> tuple[list[dict[str, Any]], int]:
-        """分页查询，返回 (记录, 总数)；记录按时间倒序（新 → 旧）。"""
-        clause, params = self._filter_clause(instance, status, q, since)
+        limit=20,
+        offset=0,
+        instance=None,
+        status=None,
+        q=None,
+        since=None,
+        kind="mcp",
+        token_id=None,
+        user_id=None,
+    ):
+        clause, params = self._filter_clause(kind, instance, status, q, since, token_id, user_id)
+        table = "mcp_calls" if kind == "mcp" else "person_events"
         with self._lock:
             conn = self._connection()
-            total = conn.execute(
-                f"SELECT COUNT(*) FROM audit_records{clause}", params
-            ).fetchone()[0]
+            total = conn.execute(f"SELECT COUNT(*) FROM {table}{clause}", params).fetchone()[0]
             rows = conn.execute(
-                f"SELECT * FROM audit_records{clause} ORDER BY id DESC LIMIT ? OFFSET ?",
-                [*params, limit, offset],
+                f"SELECT * FROM {table}{clause} ORDER BY ts DESC,rowid DESC LIMIT ? OFFSET ?",
+                [*params, max(1, min(int(limit), 50_000)), max(0, int(offset))],
             ).fetchall()
-        # sqlite3.Row 迭代得到的是值而非键，必须显式取 .keys()
-        records = [{k: row[k] for k in row.keys() if k != "id"} for row in rows]  # noqa: SIM118
-        return records, total
+        return [dict(row) for row in rows], total
 
     def export_rows(
         self,
-        instance: str | None = None,
-        status: str | None = None,
-        q: str | None = None,
-        since: str | None = None,
-        cap: int = 50_000,
-    ) -> list[dict[str, Any]]:
-        """导出用：按同样条件取全量（带上限保护），新 → 旧。"""
-        clause, params = self._filter_clause(instance, status, q, since)
-        with self._lock:
-            rows = self._connection().execute(
-                f"SELECT * FROM audit_records{clause} ORDER BY id DESC LIMIT ?",
-                [*params, cap],
-            ).fetchall()
-        return [{k: row[k] for k in row.keys() if k != "id"} for row in rows]  # noqa: SIM118
+        instance=None,
+        status=None,
+        q=None,
+        since=None,
+        cap=50_000,
+        kind="mcp",
+        token_id=None,
+        user_id=None,
+    ):
+        return self.query(
+            limit=cap,
+            instance=instance,
+            status=status,
+            q=q,
+            since=since,
+            kind=kind,
+            token_id=token_id,
+            user_id=user_id,
+        )[0]
+
+    async def update_target(self, call_id: str, record: dict[str, Any]) -> None:
+        fields = [key for key in _MCP_FIELDS if key.startswith("target_") and key in record]
+
+        def update():
+            with self._lock:
+                conn = self._connection()
+                conn.execute(
+                    "UPDATE mcp_calls SET " + ",".join(f"{key}=?" for key in fields) + " WHERE id=?",
+                    [record[key] for key in fields] + [call_id],
+                )
+                conn.commit()
+
+        await self._safe_write(update)
 
     def close(self) -> None:
         with self._lock:
@@ -242,78 +453,208 @@ class AuditLogger:
                 self._conn.close()
                 self._conn = None
 
+    async def attempt(self, call_id: str, attempt: int, status: str, error: str | None) -> None:
+        def write():
+            with self._lock:
+                conn = self._connection()
+                conn.execute(
+                    "INSERT INTO mcp_attempts(call_id,attempt,ts,ended_at,status,error) VALUES (?,?,?,?,?,?) "
+                    "ON CONFLICT(call_id,attempt) DO UPDATE SET ended_at=excluded.ended_at,status=excluded.status,error=excluded.error "
+                    "WHERE excluded.status NOT IN ('running','started') OR mcp_attempts.status IN ('running','started')",
+                    (
+                        call_id,
+                        attempt,
+                        _now(),
+                        None if status in ("running", "started") else _now(),
+                        status,
+                        redact(error)[:_MAX_TEXT] if error else None,
+                    ),
+                )
+                conn.commit()
 
-class AuditMiddleware(Middleware):
-    """在 on_call_tool 钩子统一记录，一处覆盖所有工具（含未来新增）。"""
+        await self._safe_write(write)
 
-    def __init__(self, audit: AuditLogger):
-        self._audit = audit
 
-    async def on_call_tool(self, context: MiddlewareContext, call_next):
-        message = context.message
-        args: dict[str, Any] = dict(message.arguments or {})
-        args["__tool__"] = message.name
+async def record_attempt(attempt: int, status: str, error: str | None = None) -> None:
+    entry = _CALL.get()
+    if entry:
+        audit, call_id, secrets = entry
+        await audit.attempt(call_id, attempt, status, redact(error, secrets) if error else None)
+    raise_if_cancelled()
 
-        # 明文语句由参数派生：SQL 工具取 sql、Redis 工具按命令名拼接，
-        # 取不到（如 list_instances）就只记元数据
-        statement = _statement_from_args(args)
-        truncated_flag: int | None = None
-        if statement is not None:
-            if len(statement) > self._audit.max_statement_chars:
-                statement = statement[: self._audit.max_statement_chars]
-                truncated_flag = 1
-            else:
-                truncated_flag = 0
 
-        record: dict[str, Any] = {
-            "ts": _utc_now().isoformat(timespec="milliseconds"),
-            "user": current_user(),
-            "tool": message.name,
-            "instance": args.get("instance"),
-            "kind": _kind_of(message.name),
-            "statement": statement,
-            "statement_truncated": truncated_flag,
-        }
-        if context.fastmcp_context is not None:
-            try:
-                record["request_id"] = context.fastmcp_context.request_id
-            except Exception:  # noqa: BLE001, S110 - 可选字段，尽力而为
-                pass
+def _context_identity(state: Any) -> tuple[dict[str, Any], tuple[str, ...]]:
+    identity = {"user": current_user()}
+    secrets: list[str] = []
+    try:
+        token = get_access_token()
+        if token:
+            identity["token_id"] = token.client_id
+            value = getattr(token, "token", None)
+            if value:
+                secrets.append(value)
+            if state is not None:
+                info = state.identity.token_info(token.client_id)
+                if info:
+                    identity.update(token_name=info.get("name"), token_prefix=info.get("prefix"))
+    except Exception:  # noqa: BLE001 - optional identity enrichment
+        _LOG.debug("认证上下文不可用")
+    if state is not None:
+        for instance in state.config.instances.values():
+            value = instance.password.get_secret_value()
+            if value:
+                secrets.append(value)
+    return identity, tuple(secrets)
 
-        start = time.monotonic()
-        try:
-            result = await call_next(context)
-        except Exception as exc:
-            record["status"] = "error"
-            record["error"] = f"{type(exc).__name__}: {exc}"
-            raise
-        else:
-            record["status"] = "ok"
-            record["row_count"] = _row_count_of(result)
-            return result
-        finally:
-            record["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
-            await self._audit.log(record)
+
+
+def _target_fields(inst: Any) -> dict[str, Any]:
+    return {
+        "target_type": inst.type,
+        "target_host": inst.host,
+        "target_port": inst.port,
+        "target_database": str(inst.database),
+        "target_username": getattr(inst, "user", getattr(inst, "username", "")),
+    }
+
+
+async def record_target(inst: Any) -> None:
+    """在连接池实际选择目标时刷新快照，避免配置热更新竞态造成归属错误。"""
+    entry = _CALL.get()
+    if entry:
+        audit, call_id, secrets = entry
+        password = inst.password.get_secret_value()
+        if password and password not in secrets:
+            # The list is shared with the middleware across wait_for's child task.
+            secrets.append(password)
+        # finish_call 只补给定字段；started_at 保留，最终状态仍由中间件写入。
+        await audit.update_target(call_id, _target_fields(inst))
+    raise_if_cancelled()
+
+
+_REDIS_CMD_NAMES = {
+    "redis_get": "GET", "redis_mget": "MGET", "redis_set": "SET", "redis_del": "DEL",
+    "redis_expire": "EXPIRE", "redis_persist": "PERSIST", "redis_ttl": "TTL",
+    "redis_exists": "EXISTS", "redis_type": "TYPE", "redis_keys": "KEYS", "redis_scan": "SCAN",
+    "redis_list_range": "LRANGE", "redis_list_push": "PUSH", "redis_list_pop": "POP",
+    "redis_hash_get": "HGETALL", "redis_hash_set": "HSET", "redis_hash_del": "HDEL",
+    "redis_set_members": "SMEMBERS", "redis_set_add": "SADD", "redis_set_remove": "SREM",
+    "redis_zset_range": "ZRANGE", "redis_zset_add": "ZADD", "redis_zset_remove": "ZREM",
+}
+
+
+def _statement_from_args(args: dict[str, Any]) -> str | None:
+    if isinstance(args.get("sql"), str):
+        return args["sql"]
+    tool = str(args.get("__tool__") or "")
+    cmd = _REDIS_CMD_NAMES.get(tool)
+    if cmd is None:
+        # 元数据工具也保留 schema/table 定位，但不保存完整查询结果。
+        fields = {key: args[key] for key in ("schema", "table") if key in args}
+        return json.dumps(fields, ensure_ascii=False) if fields else None
+    if tool == "redis_hash_get" and args.get("fields"):
+        cmd = "HMGET"
+    elif tool == "redis_list_push":
+        cmd = "LPUSH" if args.get("left", False) else "RPUSH"
+    elif tool == "redis_list_pop":
+        cmd = "LPOP" if args.get("left", True) else "RPOP"
+    elif tool == "redis_zset_range" and args.get("desc"):
+        cmd = "ZREVRANGE"
+    target = args.get("key") or args.get("pattern") or args.get("keys")
+    # Redis 写入值和 SQL params 均不复制到审计；命令、目标与非正文控制参数可读。
+    control = {key: args[key] for key in ("fields", "ttl", "seconds", "start", "stop", "cursor", "count") if key in args}
+    statement = cmd if target is None else f"{cmd} {target}"
+    return statement + (" " + json.dumps(control, ensure_ascii=False) if control else "")
 
 
 def _kind_of(tool: str) -> str:
-    if tool.startswith("postgres"):
-        return "sql"
-    if tool.startswith("redis"):
-        return "redis"
-    return "meta"
+    return "sql" if tool.startswith("postgres") else "redis" if tool.startswith("redis") else "meta"
 
 
-def _row_count_of(result: Any) -> int | None:
-    """从工具返回值里尽力取 row_count（结构化输出为 pydantic 模型时为 int）。"""
-    try:
+def _result_summary(result: Any) -> dict[str, Any]:
+    data = getattr(result, "structured_content", None)
+    if not isinstance(data, dict):
         data = getattr(result, "data", None)
-        value = getattr(data, "row_count", None)
-        if isinstance(value, int):
-            return value
-        value = getattr(data, "deleted", None)
-        if isinstance(value, int):
-            return value
-    except Exception:  # noqa: BLE001, S110 - 可选字段，尽力而为
-        pass
-    return None
+        if hasattr(data, "model_dump"):
+            data = data.model_dump()
+    if not isinstance(data, dict):
+        return {}
+    summary = {}
+    for name in ("row_count", "deleted", "count", "length"):
+        if isinstance(data.get(name), int):
+            summary["row_count"] = data[name]
+            break
+    summary["result_truncated"] = int(bool(data.get("truncated")))
+    if data.get("status") == "error":
+        summary.update(status="error", error=data.get("error"))
+    return summary
+
+
+class AuditMiddleware(Middleware):
+    def __init__(self, audit: AuditLogger, state: Any = None):
+        self._audit = audit
+        self._state = state
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        from .errors import (
+            ConfirmationRequiredError,
+            InstanceDisabledError,
+            PermissionDeniedError,
+            StatementNotAllowedError,
+        )
+
+        args = dict(context.message.arguments or {})
+        identity, secrets = await asyncio.to_thread(_context_identity, self._state)
+        args["__tool__"] = context.message.name
+        record = {
+            **identity, "ts": _now(), "tool": context.message.name,
+            "instance": args.get("instance"), "kind": _kind_of(context.message.name),
+            "statement": redact(_statement_from_args(args), secrets),
+        }
+        if self._state is not None:
+            target = self._state.config.get_instance(str(args.get("instance") or ""))
+            if target:
+                record.update(_target_fields(target))
+        if context.fastmcp_context is not None:
+            try:
+                record["request_id"] = str(context.fastmcp_context.request_id)
+            except Exception:  # noqa: BLE001 - optional request metadata
+                _LOG.debug("请求编号不可用")
+        try:
+            request = get_http_request()
+            if request.client:
+                record["source_ip"] = request.client.host
+        except RuntimeError:
+            pass
+        started = time.monotonic()
+        call_id = await self._audit.begin_call(record)
+        call_secrets = list(secrets)
+        scope = _CALL.set((self._audit, call_id, call_secrets))
+        outcome: dict[str, Any] = {"status": "unknown"}
+        try:
+            raise_if_cancelled()
+            result = await call_next(context)
+            raise_if_cancelled()
+            outcome["status"] = "error" if getattr(result, "is_error", False) else "ok"
+            outcome.update(_result_summary(result))
+            if outcome["status"] == "error" and not outcome.get("error"):
+                parts = [getattr(block, "text", "") for block in getattr(result, "content", [])]
+                outcome["error"] = " ".join(parts)[:_MAX_TEXT]
+            if outcome.get("error"):
+                outcome["error"] = redact(outcome["error"], call_secrets)
+            return result
+        except asyncio.CancelledError:
+            outcome.update(status="cancelled", error="请求已取消；数据库操作是否完成需另行核实")
+            raise
+        except Exception as exc:
+            if isinstance(exc, (PermissionDeniedError, StatementNotAllowedError,
+                                ConfirmationRequiredError, InstanceDisabledError)):
+                status = "denied"
+            else:
+                status = "timeout" if "timeout" in type(exc).__name__.lower() else "error"
+            outcome.update(status=status, error=redact(f"{type(exc).__name__}: {exc}", call_secrets))
+            raise
+        finally:
+            _CALL.reset(scope)
+            outcome["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
+            await self._audit.finish_call(call_id, outcome)

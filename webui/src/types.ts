@@ -1,57 +1,75 @@
-/* 领域类型：db-mcp API 契约 */
-
-export type InstanceType = 'postgres' | 'redis'
-export type Permissions = 'read' | 'write'
-
+export interface User {
+  id: string;
+  username: string;
+  display_name: string;
+  enabled: boolean;
+  created_at?: string;
+  last_login_at?: string | null;
+}
+export interface Session {
+  user: User;
+  csrf_token: string;
+}
 export interface InstanceEntry {
-  name: string
-  type: InstanceType
-  host: string
-  port: number
-  permissions: Permissions
-  enabled: boolean
-  has_password: boolean
-  // postgres
-  database?: string
-  user?: string
-  schema?: string
-  // redis
-  username?: string
+  name: string;
+  type: "postgres" | "redis";
+  host: string;
+  port: number;
+  database: string | number;
+  user?: string;
+  username?: string;
+  schema?: string;
+  permissions: "read" | "write";
+  enabled: boolean;
+  has_password: boolean;
 }
-
+export interface TokenEntry {
+  id: string;
+  name: string;
+  description: string;
+  prefix: string;
+  enabled: boolean;
+  revoked: boolean;
+  created_by: string | null;
+  created_at: string;
+  last_used_at: string | null;
+}
 export interface AuditRecord {
-  ts: string
-  user: string
-  tool: string
-  instance?: string
-  kind?: 'sql' | 'redis' | 'meta' | string
-  statement?: string
-  statement_truncated?: number
-  row_count?: number
-  status: 'ok' | string
-  duration_ms: number
-  request_id?: string
-  error?: string
+  id: string | number;
+  ts: string;
+  ended_at?: string | null;
+  status: string;
+  token_id?: string | null;
+  token_name?: string | null;
+  token_prefix?: string | null;
+  tool?: string | null;
+  instance?: string | null;
+  kind?: string | null;
+  statement?: string | null;
+  statement_truncated?: number | null;
+  row_count?: number | null;
+  target_type?: string | null;
+  target_database?: string | number | null;
+  target_host?: string | null;
+  target_port?: number | null;
+  target_username?: string | null;
+  actor_user_id?: string | null;
+  username?: string | null;
+  user?: string | null;
+  action?: string | null;
+  object_type?: string | null;
+  object_id?: string | null;
+  summary?: string | null;
+  error?: string | null;
+  source_ip?: string | null;
+  duration_ms?: number | null;
+  request_id?: string | null;
+  legacy?: boolean;
 }
-
-export interface Me {
-  username: string
-  admin: boolean
-  default_admin?: boolean
-}
-
-export const TYPE_LABEL: Record<InstanceType, string> = {
-  postgres: 'PostgreSQL',
-  redis: 'Redis',
-}
-
-/* 各类型的表单字段（决定新增/编辑弹窗展示哪些输入项） */
-export const TYPE_FIELDS: Record<InstanceType, string[]> = {
-  postgres: ['host', 'port', 'database', 'user', 'password', 'schema'],
-  redis: ['host', 'port', 'username', 'password', 'database'],
-}
-
-export const DEFAULT_PORT: Record<InstanceType, number> = {
-  postgres: 5432,
-  redis: 6379,
-}
+export type AuditKind = "mcp" | "person";
+export type Page =
+  | "instances"
+  | "users"
+  | "tokens"
+  | "mcp-audit"
+  | "person-audit";

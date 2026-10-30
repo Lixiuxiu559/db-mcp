@@ -13,14 +13,20 @@ def read_records(audit_path):
     conn = sqlite3.connect(audit_path)
     conn.row_factory = sqlite3.Row
     try:
-        return [dict(r) for r in conn.execute("SELECT * FROM audit_records ORDER BY id").fetchall()]
+        return [dict(r) for r in conn.execute("SELECT * FROM mcp_calls ORDER BY ts,rowid").fetchall()]
     finally:
         conn.close()
 
 
-async def _web_get(app, path: str, token: str):
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
-        return await client.get(path, headers={"Authorization": f"Bearer {token}"})
+async def _web_get(gw, path: str, token: str = ""):
+    # 网页只接受人员会话；legacy MCP token 不能作为网页凭证。
+    identity = gw.state.identity
+    if identity.setup_required:
+        identity.initialize("audit-reader", "test-password-123", identity.setup_key_path.read_text())
+    async with AsyncClient(transport=ASGITransport(app=gw.mcp.http_app()), base_url="http://t") as client:
+        login = await client.post("/api/auth/login", json={"username": "audit-reader", "password": "test-password-123"})
+        assert login.status_code == 200
+        return await client.get(path)
 
 
 async def test_audit_records_sql_plaintext(gw, tmp_path):
@@ -80,7 +86,7 @@ async def test_audit_truncates_long_statement(gw, tmp_path):
 
 
 async def test_audit_never_stores_password(gw, tmp_path):
-    """密码绝不能出现在审计库里（语句里出现密码字面量则按原样记录，但配置密码不会）。"""
+    """已知配置密码不能出现在审计库里。SQL 中的常见凭据字段也脱敏。"""
     async with Client(gw.mcp) as client:
         await client.call_tool("list_instances", {})
         await client.call_tool("db_ping", {"instance": "pg-read"})
@@ -91,27 +97,25 @@ async def test_audit_never_stores_password(gw, tmp_path):
 
 
 async def test_audit_visible_via_web(gw, tmp_path):
-    app = gw.mcp.http_app()
     async with Client(gw.mcp) as client:
         await client.call_tool("postgres_query", {"instance": "pg-read", "sql": "SELECT 42"})
 
-    resp = await _web_get(app, "/api/audit?limit=10", "tok-alice")
+    resp = await _web_get(gw, "/api/audit?limit=10", "tok-alice")
     body = resp.json()
     assert body["total"] == 1
     assert body["records"][0]["statement"] == "SELECT 42"
 
 
 async def test_audit_pagination(gw):
-    app = gw.mcp.http_app()
     async with Client(gw.mcp) as client:
         for i in range(7):
             await client.call_tool(
                 "postgres_query", {"instance": "pg-read", "sql": f"SELECT {i}"}
             )
 
-    page1 = (await _web_get(app, "/api/audit?limit=3&offset=0", "tok-alice")).json()
-    page2 = (await _web_get(app, "/api/audit?limit=3&offset=3", "tok-alice")).json()
-    page3 = (await _web_get(app, "/api/audit?limit=3&offset=6", "tok-alice")).json()
+    page1 = (await _web_get(gw, "/api/audit?limit=3&offset=0", "tok-alice")).json()
+    page2 = (await _web_get(gw, "/api/audit?limit=3&offset=3", "tok-alice")).json()
+    page3 = (await _web_get(gw, "/api/audit?limit=3&offset=6", "tok-alice")).json()
 
     assert page1["total"] == page2["total"] == page3["total"] == 7
     # 最新在前
@@ -121,51 +125,48 @@ async def test_audit_pagination(gw):
 
 
 async def test_audit_filter_by_instance_and_status(gw):
-    app = gw.mcp.http_app()
     async with Client(gw.mcp) as client:
         await client.call_tool("postgres_query", {"instance": "pg-read", "sql": "SELECT 1"})
         await client.call_tool(
             "postgres_query", {"instance": "nope", "sql": "SELECT 2"}, raise_on_error=False
         )
 
-    body = (await _web_get(app, "/api/audit?instance=pg-read", "tok-alice")).json()
+    body = (await _web_get(gw, "/api/audit?instance=pg-read", "tok-alice")).json()
     assert body["total"] == 1
     assert body["records"][0]["statement"] == "SELECT 1"
 
-    body = (await _web_get(app, "/api/audit?status=error", "tok-alice")).json()
+    body = (await _web_get(gw, "/api/audit?status=error", "tok-alice")).json()
     assert body["total"] == 1
     assert body["records"][0]["status"] == "error"
 
 
 async def test_audit_keyword_filter(gw):
-    app = gw.mcp.http_app()
     async with Client(gw.mcp) as client:
         await client.call_tool(
             "postgres_query", {"instance": "pg-read", "sql": "SELECT * FROM find_me"}
         )
         await client.call_tool("postgres_query", {"instance": "pg-read", "sql": "SELECT 1"})
 
-    body = (await _web_get(app, "/api/audit?q=find_me", "tok-alice")).json()
+    body = (await _web_get(gw, "/api/audit?q=find_me", "tok-alice")).json()
     assert body["total"] == 1
     assert "find_me" in body["records"][0]["statement"]
 
     # 关键词也命中工具名
-    assert (await _web_get(app, "/api/audit?q=postgres_query", "tok-alice")).json()["total"] == 2
+    assert (await _web_get(gw, "/api/audit?q=postgres_query", "tok-alice")).json()["total"] == 2
 
 
 async def test_audit_csv_export(gw):
-    app = gw.mcp.http_app()
     async with Client(gw.mcp) as client:
         await client.call_tool(
             "postgres_query", {"instance": "pg-read", "sql": "SELECT '=SUM(A1:A9)'"}
         )
 
-    resp = await _web_get(app, "/api/audit/export", "tok-alice")
+    resp = await _web_get(gw, "/api/audit/export", "tok-alice")
     assert resp.status_code == 200
     assert "text/csv" in resp.headers["content-type"]
     assert "attachment" in resp.headers["content-disposition"]
     header = resp.text.splitlines()[0]
-    assert "ts,user,tool,instance,kind,status" in header
+    assert {"ts", "user", "tool", "instance", "kind", "status"} <= set(header.lstrip("\ufeff").split(","))
     # 公式注入防护：以 = 开头的内容被加了前缀
     assert "'=SUM(A1:A9)" in resp.text
 

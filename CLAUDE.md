@@ -1,33 +1,22 @@
-# db-mcp — 开发指引
+# db-mcp 开发指引
 
-团队共享数据库网关 MCP 服务（PostgreSQL / Redis）。本文件记录**架构地图**与
-**实测踩出来的非显然约束**，改代码前请先读「关键不变量」一节。功能与部署说明见 `README.md`。
+独立 PostgreSQL / Redis MCP 服务仓库。遵循工作空间最新统一架构和 Linkage 1.0 规范，运行、测试、打包不能依赖父目录或兄弟服务。
+当前版本 2.1.0，Python FastMCP 精确 4.1.4。
 
-## 架构地图
+## 架构
 
-```
-cli.py            入口：load_dotenv → ConfigFile → create_mcp → mcp.run(transport="http")
-server.py         组装：StaticTokenVerifier 认证 + lifespan + AuditMiddleware + 注册工具/路由
-config.py         pydantic 配置模型、YAML 原始树读写（原子写）、${ENV} 展开、实例判别联合
-state.py          DbState：内存配置 + ConnectionPool + AuditLogger（配置热更新入口）
-sqlguard.py       SQL 词法分析与安全判定（只读/写/高危/多语句/危险函数）——本服务的核心安全模块
-audit.py          SQLite 审计（中间件 + 查询 + 30 天保留），记录语句明文
-errors.py         领域异常（DbMcpError 及其子类）
-dependencies.py   get_state（工具通过 Depends 拿状态）
-db/pool.py        连接池：按实例缓存 asyncpg 池 / redis 客户端、断线重试、并发限流
-db/pg.py          PostgreSQL 执行封装：只读事务 + 流式游标截断 + 错误翻译
-models.py         工具返回值的 pydantic 模型
-tools/            inventory / postgres / redis（各含 register(mcp)）
-web/api.py        管理端 API + 静态资源路由（与 MCP 共用一套 token 认证）
-web/static/       webui 构建产物（入库，部署零额外步骤）
-webui/            React + TS + AntD6 前端源码；vite build → ../src/db_mcp/web/static/
-```
+- `cli.py`：配置初始化、路径与监听覆盖、HTTP 启动。
+- `config.py`：Pydantic、原始 YAML 原子保存、环境变量插值、实例判别联合。
+- `auth/`：SQLite 人员、scrypt 密码、可撤销会话、独立 token、幂等旧凭证迁移、身份事件 outbox；公开 TokenVerifier 每请求验证。
+- `state.py`：配置热更新、连接池失效、身份事件投递和 30 天审计清理生命周期。
+- `server.py`：FastMCP 认证、lifespan、中间件、工具与管理 API 组装。
+- `audit.py`：独立人员/MCP/尝试审计、开始与终态、实际目标快照、旧表迁移。
+- `sqlguard.py` / `db/pg.py` / `db/pool.py`：SQL 分类、数据库只读事务、流式查询、连接池与重试。
+- `tools/`：inventory、postgres、redis。`web/api.py`：Cookie + CSRF 管理 API，不复用 MCP token。
+- `webui/`：React19 TS Vite Tailwind4 BaseUI shadcn源码 TanStack Lucide；构建产物 `src/db_mcp/web/static/`。
 
-请求流：`MCP/HTTP → 认证 → AuditMiddleware（无论如何都记一条）→ 工具 → 权限校验 →
-sqlguard → ConnectionPool → asyncpg/redis`
-
-配置热更新：管理端写配置 → `ConfigFile.save()` 原子写回 → `state.upsert_instance()` →
-参数变化时 `pool.invalidate()` → 工具下次调用即生效（无需重启）。
+MCP 请求路径：认证 → 审计开始 → 工具权限 → SQL 静态分析 → 只读事务/连接池 → 审计终态。
+配置写入后刷新内存并失效相关连接池；SQL防护、参数限制、危险操作确认不因网页同权而改变。
 
 ## 关键不变量（改代码前必读）
 
@@ -83,7 +72,7 @@ sqlguard → ConnectionPool → asyncpg/redis`
    要让 LLM 看懂"该实例是只读的、请换 write 实例"。
 
 10. **密码只写不读**：`instances` CRUD 永不返回密码内容，只给 `has_password` 布尔。
-    成员 token 是例外——管理页可查看（便于运维重置）。
+    MCP token 仅创建时一次展示；其他接口只能返回元数据。
     审计库只记语句明文，**绝不记密码**（有测试断言审计文件里不含密码字节）。
 
 11. **`${ENV_VAR}` 在保存时保留原文、在校验时展开**。
@@ -95,9 +84,9 @@ sqlguard → ConnectionPool → asyncpg/redis`
     因此容器部署**必须挂目录、不能挂单个文件**——单文件 bind mount 会让临时文件与
     目标落在不同文件系统，rename 必然失败。
 
-13. **权限模型**：管理页仅 `admin` 可进；`instances`/`audit` 的 GET 只需认证；
-    写操作 + 成员管理 + 配置导出要求 `admin`。`auth.users` 为空时自动启用内置
-    引导账号 `admin/admin`（`/api/me` 返回 `default_admin` 标记），配置了成员即失效。
+13. **网页人员与 MCP token 完全分离**：用户名密码登录 + 可撤销会话 Cookie +
+    CSRF 校验，所有启用人员同权；人员与 token 独立管理。禁止默认账号、token 登录网页、
+    将 token 存 localStorage。旧 auth.users 仅用于幂等迁移 MCP token，不恢复旧角色模型。
 
 14. **前端资源必须相对路径**（`vite base: './'` + api 客户端 `apiUrl()` 去前导 `/`）。
     网关 nginx 按 `location /db-mcp/ { proxy_pass .../; }` 剥前缀，任何指向根路径的
@@ -109,105 +98,30 @@ sqlguard → ConnectionPool → asyncpg/redis`
 16. **redis-py `decode_responses=True`**，所以返回值是 `str` 而非 `bytes`。
     但 `info()` 在 redis-py 5/6 返回 awaitable，`inventory.py` 里做了兼容判断。
 
-## 开发命令
+## 新增功能要求
+
+新增工具必须通过统一 FastMCP 注册路径和审计中间件，保留可读领域错误与实际目标追溯。
+新增页面遵循 Linkage 1.0：服务内持有 tokens.css、字体和组件源码，石墨窄导航、紧凑表格、语义状态，禁止 Ant Design 与玻璃布局。
+三态主题 `light/dark/auto`，存储键 `linkage-theme`，实际主题写 `data-theme`；相对 API/资源路径、键盘操作、390px 窄屏必须验证。
+
+审计默认30天，身份存储不受审计清理影响。稳定token身份与目标快照必须留存；旧token升级继续可用，显式停用/吊销才拒绝新请求。
+身份修改与outbox同事务，资源配置副作用记录开始和结果；不得记录密码/token/会话秘密或把跨文件操作写成原子事务。
+
+所有新服务/交付维持源码uv、Docker/Compose、wheel/sdist+uvx三种方式，包含完整后台与MCP HTTP。运行数据使用持久化可写路径，不进Git、镜像、包缓存。
+
+## 验证与发布
 
 ```bash
-uv sync                                # 安装依赖
-uv run pytest                          # 测试（Fake asyncpg 池 + Fake Redis）
-uv run ruff check src tests            # lint
-uv run db-mcp -c config.yaml           # 本地启动（默认 0.0.0.0:8807）
-
-# 前端
-cd webui && npm install
-cd webui && npm run build              # 构建产物直接输出到 src/db_mcp/web/static/
-cd webui && npx tsc --noEmit           # 类型检查（改了 .tsx 必跑）
-
-# 镜像：见下方「发布镜像」
+uv sync --locked
+uv run --locked pytest
+uv run --locked ruff check src tests
+cd webui
+npm ci
+npm run build
 ```
 
-**提交前**：`uv run pytest` 全绿 + `ruff check` 干净 + 改了前端要 `tsc --noEmit`。
-
-## 发布镜像（ACR）
-
-镜像仓库：`docker.io/lijx559/db-mcp`
-
-### 1. 前置：改了前端先构建
-
-镜像构建**不会**跑 npm——`src/db_mcp/web/static/` 是入库的构建产物，Dockerfile 直接
-COPY 它。**改了 `webui/` 就必须先 `cd webui && npm run build`**，否则镜像里的前端还是旧的。
-
-### 2. 登录（首次或凭据过期）
-
-```bash
-docker login docker.io
-# 用户名/密码来自阿里云 ACR 控制台，不是阿里云账号密码
-```
-
-### 3. 构建并推送（一条命令）
-
-```bash
-cd db-mcp   # 在工作空间中先 cd mcps/db-mcp
-docker buildx build --platform linux/amd64 \
-  -t docker.io/lijx559/db-mcp:2.0.1 \
-  --push .
-```
-
-`--push` 构建完直接推送，无需再 `docker push`。
-（想先在本地跑一遍验证，可用 `--load` 代替 `--push`，验证无误后再推。）
-
-### 4. 验证推送结果
-
-```bash
-docker buildx imagetools inspect \
-  docker.io/lijx559/db-mcp:2.0.1 \
-  --format '{{json .Image}}' \
-  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['os'], d['architecture'])"
-# 必须输出：linux amd64
-```
-
-### 关键注意（与 ssh-mcp 同源，都是踩过的坑）
-
-1. **必须 `--platform linux/amd64`**。目标机是 x86_64；在 Apple Silicon 上直接
-   `docker build` 产出 arm64 镜像，推上去在目标机报 `exec format error`。
-2. **基础镜像必须同时提供目标架构**。Dockerfile 的 `ARG BASE_IMAGE` 默认
-   `docker.m.daocloud.io/library/python:3.12-slim`（amd64 + arm64 都有）。
-3. **ACR 端点用公网（不带 `-vpc`）**。`-vpc` 只能在阿里云 VPC 内拉取。
-4. **版本号只增不覆盖**。compose 靠 tag 判断是否更新；覆盖已发布 tag 会导致目标机
-   拉到缓存旧镜像。改代码 → 递增版本（2.0.0 → 2.0.1）。
-
-## 测试约定
-
-- `tests/conftest.py` 提供 `FakePgPool`/`FakePgConn`/`FakeCursorFactory`/`FakeRedis`/
-  `Harness`，monkeypatch `asyncpg.create_pool` 与 `redis.asyncio.Redis`。
-- **fake 必须对齐真实驱动行为**：`FakePgConn.prepare` 是 async（真实是 async）；
-  `cursor()` 返回异步可迭代对象（真实是 `CursorFactory`，无 `async with`）；
-  只读事务里执行写语句会抛 `asyncpg.PostgresError`（真实行为）。
-  比真实宽松的 mock 会掩盖 bug（不变量 5）。
-- `call(gw, "tool_name", **args)` 是调用工具的统一入口（in-memory Client）。
-- 新增错误路径时，**断言错误信息可读**（含关键词），而不是只断言 `is_error`。
-- 安全相关的测试集中在 `test_sqlguard.py`（分类逻辑）与 `test_tools.py`
-  （read 实例拒绝写、DDL confirm、只读事务兜底、危险函数）。
-
-## 已知边界
-
-- 每条 SQL 只执行单条语句（多语句被拒），请拆成多次调用
-- SQL 静态分析是词法级的，无法判定存储过程内部行为；只读实例靠只读事务兜底
-- 查询结果受 `limits.max_rows` / `max_result_chars` 截断
-- `redis_keys`（KEYS）在大数据集上阻塞 Redis，优先用 `redis_scan`
-- 网页保存配置会重写整个 YAML（**注释丢失**），`${ENV}` 引用原样保留
-- 审计默认保留 30 天（`audit.retention_days`），记录语句明文（`max_statement_chars` 截断）
-
-## 版本记录
-
-- `0.1.x` 内部开发版本（未发布）
-- `2.0.0` 首个发布版本，**完全重写**：取代 ACR 上原有的 TS 版 `base/db-mcp:1.x`
-  （Express + pg + ioredis → Python + FastMCP）。配置格式与工具集都不兼容，
-  不是 1.x 的增量升级，故直接跳到 2.0.0。能力：PostgreSQL / Redis 多实例、
-  按实例 read/write 分级、三层只读防护、高危 DDL 二次确认、完整管理端、语句明文审计
-- `2.0.1` 修复：**write 实例上的查询返回空数据**（不变量 7b）——`read_only` 被错绑到
-  实例权限，导致 write 实例的 SELECT 走了写路径、丢失行列数据
-
-> **多项目共存**：一个项目部署一套。ACR 仓库共用 `base/db-mcp`（靠 tag 区分版本），
-> 但**容器名与 nginx 子路径必须带项目前缀**，否则多套服务会互相覆盖。
-> 例如 example-project 项目：容器 `example-project-db-mcp`、子路径 `/example-project-db-mcp/`、
-> 部署目录 `/opt/example-project-db-mcp/`。
+改前端必须重建静态产物并入库。测试fake必须对齐真实asyncpg与redis行为，不能使用宽松mock掩盖真实API错误。
+回归要覆盖只读防护、write实例SELECT返回数据、token持久/撤销、Cookie与MCP认证隔离、同权、双审计及子路径。
+升级FastMCP必须精确pin并提交uv.lock，按分支回归/部署版本/备份数据回滚，不在启动时自动更新。
+发布镜像标签只增不覆盖，目标x86_64必须构建linux/amd64；本地验证不代表远端发布，不自动push。
+已发布旧版2.0.1不可被新标签覆盖。本次2.1.0发布前先备份并演练旧auth.users和audit_records迁移。

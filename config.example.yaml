@@ -3,18 +3,16 @@
 # $$ 表示字面 $。
 
 server:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 8807
 
 auth:
-  # 未配置任何用户时，服务启用内置默认管理员 admin/admin（引导账号，
-  # 启动日志会提示）；配置了用户后默认账号自动失效。
-  users:
-    - username: alice
-      token: ${DBMCP_TOKEN_ALICE}
-      admin: true          # admin 可在网页上增删改配置与成员
-    - username: bob
-      token: ${DBMCP_TOKEN_BOB}
+  database: data/service.db
+  session_hours: 8
+  cookie_secure: false        # HTTPS 部署设 true
+  cookie_path: /              # 网关子路径部署可设 /项目-db-mcp/
+  # 旧版本 auth.users 仅供旧 MCP token 首次幂等迁移，不能用于网页登录。
+  # 新安装不配置人员或 token；启动后通过本机 setup.key 创建首位用户。
 
 audit:
   path: audit/audit.db     # SQLite 审计库

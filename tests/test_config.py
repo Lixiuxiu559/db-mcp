@@ -120,3 +120,103 @@ async def test_permissions_default_read(make_mcp):
         "\n  redis-default:\n    type: redis\n    host: h\n"
     )
     assert gw.state.config.get_instance("redis-default").permissions == "read"
+
+
+def test_runtime_paths_are_relative_to_config_directory(tmp_path, monkeypatch):
+    from db_mcp.config import ConfigFile
+
+    config_dir = tmp_path / "configured"
+    config_dir.mkdir()
+    path = config_dir / "config.yaml"
+    path.write_text("instances: {}\n")
+    monkeypatch.chdir(tmp_path)
+    cfg = ConfigFile(path).load()
+    assert cfg.auth.database == config_dir / "data" / "service.db"
+    assert cfg.audit.path == config_dir / "audit" / "audit.db"
+    assert cfg.server.host == "127.0.0.1"
+    assert cfg.server.port == 8807
+    assert cfg.auth.users == []
+
+
+def test_auth_settings_validation():
+    from pydantic import ValidationError
+
+    from db_mcp.config import AuthConfig
+
+    assert AuthConfig(cookie_path="/db-mcp/").cookie_path == "/db-mcp/"
+    with pytest.raises(ValidationError, match="cookie_path"):
+        AuthConfig(cookie_path="/db-mcp")
+    with pytest.raises(ValidationError, match="session_hours"):
+        AuthConfig(session_hours=0)
+
+
+def test_cli_initializes_private_empty_config_without_overwrite(tmp_path, monkeypatch, capsys):
+    from db_mcp.cli import main
+    from db_mcp.config import ConfigFile
+
+    path = tmp_path / "runtime" / "config.yaml"
+    monkeypatch.setattr("sys.argv", ["db-mcp", "--init", "--config", str(path)])
+    main()
+    assert st.S_IMODE(path.stat().st_mode) == 0o600
+    config = ConfigFile(path).load()
+    assert config.instances == {} and config.auth.users == []
+    assert config.server.port == 8807
+    original = path.read_bytes()
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 1
+    assert path.read_bytes() == original
+    assert "未覆盖" in capsys.readouterr().err
+
+
+async def test_failed_config_save_preserves_memory_and_disk(make_mcp, monkeypatch):
+    from copy import deepcopy
+
+    gw = make_mcp()
+    original = deepcopy(gw.cfg_file.raw)
+    original_bytes = gw.config_path.read_bytes()
+
+    def fail_save():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(gw.cfg_file, "save", fail_save)
+    with pytest.raises(OSError, match="disk full"):
+        await gw.state.upsert_instance("redis-read", {"type": "redis", "host": "unsaved"})
+    assert gw.cfg_file.raw == original
+    assert gw.state.config.get_instance("redis-read").host == "10.0.0.40"
+    assert gw.config_path.read_bytes() == original_bytes
+    with pytest.raises(OSError, match="disk full"):
+        await gw.state.delete_instance("redis-read")
+    assert gw.cfg_file.raw == original
+    assert gw.state.config.get_instance("redis-read") is not None
+    assert gw.config_path.read_bytes() == original_bytes
+
+
+async def test_changing_working_directory_preserves_identity_and_legacy_token(
+    tmp_path, monkeypatch
+):
+    from db_mcp.config import ConfigFile
+    from db_mcp.server import create_mcp
+
+    configured = tmp_path / "persistent"
+    configured.mkdir()
+    path = configured / "config.yaml"
+    path.write_text(
+        "auth:\n  users:\n    - username: old-client\n      token: stable-legacy-token\ninstances: {}\n"
+    )
+    _, first = create_mcp(ConfigFile(path))
+    token = first.identity.verify_token("stable-legacy-token")
+    assert token is not None
+    await first.shutdown()
+    other = tmp_path / "another-cwd"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    _, second = create_mcp(ConfigFile(path))
+    assert second.identity.path == configured / "data" / "service.db"
+    assert second.identity.verify_token("stable-legacy-token")["id"] == token["id"]
+    second.identity.revoke_token(token["id"])
+    await second.shutdown()
+    _, third = create_mcp(ConfigFile(path))
+    assert third.identity.verify_token("stable-legacy-token") is None
+    assert len(third.identity.list_tokens()) == 1
+    await third.shutdown()

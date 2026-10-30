@@ -1,10 +1,4 @@
-"""网页管理端 API：实例配置 CRUD、连接测试、审计查询、成员 token 管理。
-
-- 鉴权与 MCP 共用同一套用户 token（Authorization: Bearer <token>）
-- 管理页面仅 admin 可进入；写操作与成员管理要求 admin 标志
-- **密码只写不读**：instances CRUD 与成员接口永不返回密码明文，
-  保存时留空 = 保留原值（含 ${ENV} 引用）
-"""
+"""人员 Cookie 会话管理 API；MCP Bearer 凭证只在协议端点使用。"""
 
 from __future__ import annotations
 
@@ -12,14 +6,18 @@ import asyncio
 import csv
 import hmac
 import io
+import logging
+import uuid
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
-from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 
+from ..audit import raise_if_cancelled, redact
+from ..auth import IdentityError
 from ..config import (
     ConfigError,
     InstanceConfig,
@@ -33,6 +31,7 @@ from ..state import DbState
 _INDEX_HTML = Path(__file__).parent / "static" / "index.html"
 _STATIC_DIR = Path(__file__).parent / "static"
 _TEST_TIMEOUT = 15
+_COOKIE = "db_mcp_session"
 
 
 def _instance_payload(name: str, inst: InstanceConfig) -> dict[str, Any]:
@@ -53,307 +52,508 @@ def _instance_payload(name: str, inst: InstanceConfig) -> dict[str, Any]:
     return payload
 
 
-def _audit_filters(query_params: Any) -> dict[str, Any]:
-    """从查询串提取审计筛选条件：instance / status / q（关键词）/ days（时间范围）。"""
-    filters: dict[str, Any] = {
-        "instance": query_params.get("instance") or None,
-        "status": query_params.get("status") or None,
-        "q": (query_params.get("q") or "").strip() or None,
-    }
-    days = query_params.get("days")
-    if days:
+def _audit_filters(qp: Any) -> dict[str, Any]:
+    kind = qp.get("kind", "mcp")
+    if kind not in {"mcp", "person"}:
+        raise IdentityError("审计类型须为 mcp 或 person")
+    filters = {key: qp.get(key) or None for key in ("instance", "status", "q", "token_id", "user_id")}
+    filters["kind"] = kind
+    if qp.get("since"):
         try:
-            n = max(1, int(days))
-            filters["since"] = (datetime.now(timezone.utc) - timedelta(days=n)).isoformat(
-                timespec="milliseconds"
-            )
+            stamp = datetime.fromisoformat(qp["since"].replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                raise ValueError
+            filters["since"] = stamp.astimezone(timezone.utc).isoformat(timespec="milliseconds")
         except ValueError:
-            pass
+            raise IdentityError("since 须为包含时区的 ISO 时间") from None
+    if qp.get("days"):
+        try:
+            days = min(3650, max(1, int(qp["days"])))
+        except ValueError:
+            raise IdentityError("days 须为整数") from None
+        filters["since"] = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(
+            timespec="milliseconds"
+        )
     return filters
 
 
 def _csv_cell(value: Any) -> Any:
-    """防 CSV 公式注入：以 = + - @ 开头的单元格加前缀，避免在 Excel 中被当公式执行。"""
     if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
         return "'" + value
     return value
 
 
 def register_web_routes(mcp: FastMCP, state: DbState) -> None:
-    def authenticate(request: Request) -> tuple[Any, JSONResponse | None]:
-        header = request.headers.get("authorization", "")
-        if not header.startswith("Bearer "):
-            return None, JSONResponse({"detail": "未提供 token"}, status_code=401)
-        token = header[7:].strip()
-        for user in state.config.auth.users:
-            if hmac.compare_digest(user.token.get_secret_value(), token):
-                return user, None
-        return None, JSONResponse({"detail": "token 无效"}, status_code=401)
+    def event(
+        request,
+        action,
+        *,
+        user=None,
+        status="ok",
+        error=None,
+        object_type=None,
+        object_id=None,
+        summary=None,
+    ):
+        return {
+            "event_id": str(uuid.uuid4()),
+            "actor_user_id": user["id"] if user else None,
+            "username": user["username"]
+            if user
+            else getattr(request.state, "attempted_username", None),
+            "action": action,
+            "object_type": object_type,
+            "object_id": object_id,
+            "summary": summary,
+            "status": status,
+            "error": error,
+            "request_id": getattr(request.state, "request_id", str(uuid.uuid4())),
+            "source_ip": request.client.host if request.client else None,
+        }
 
-    def require_admin(request: Request) -> tuple[Any, JSONResponse | None]:
-        user, error = authenticate(request)
-        if error is not None:
-            return None, error
-        if not user.admin:
-            return None, JSONResponse({"detail": "需要 admin 权限"}, status_code=403)
-        return user, None
+    async def read_body(request):
+        try:
+            value = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            raise IdentityError("请求体必须是 JSON 对象") from None
+        if not isinstance(value, dict):
+            raise IdentityError("请求体必须是 JSON 对象")
+        return value
 
-    @mcp.custom_route("/", methods=["GET"])
-    async def index(request: Request) -> FileResponse | JSONResponse:
+    def route(path, methods, *, action=None, public=False, object_type=None):
+        def decorate(handler):
+            @wraps(handler)
+            async def wrapped(request):
+                request.state.request_id = str(uuid.uuid4())
+                request.state.user = None
+                request.state.identity_event = None
+                request.state.outbox_recorded = False
+                if public and request.method == "POST":
+                    content_type = request.headers.get("content-type", "").split(";", 1)[0]
+                    if content_type != "application/json":
+                        return JSONResponse({"detail": "请使用 application/json"}, status_code=400)
+                if not public:
+                    session = await asyncio.to_thread(
+                        state.identity.session, request.cookies.get(_COOKIE)
+                    )
+                    if session is None:
+                        if action:
+                            await state.audit.log_person(
+                                event(
+                                    request,
+                                    action,
+                                    status="denied",
+                                    error="网页登录认证失败",
+                                    object_type=object_type,
+                                )
+                            )
+                        return JSONResponse({"detail": "请使用用户名和密码登录"}, status_code=401)
+                    request.state.user, request.state.csrf_token = session
+                    if request.method not in {"GET", "HEAD"}:
+                        csrf = request.headers.get("x-csrf-token", "")
+                        if not hmac.compare_digest(session[1], csrf):
+                            if action:
+                                await state.audit.log_person(
+                                    event(
+                                        request,
+                                        action,
+                                        user=session[0],
+                                        status="denied",
+                                        error="CSRF校验失败",
+                                        object_type=object_type,
+                                    )
+                                )
+                            return JSONResponse(
+                                {"detail": "CSRF 校验失败，请刷新页面"}, status_code=403
+                            )
+                record = (
+                    event(
+                        request,
+                        action,
+                        user=request.state.user,
+                        object_type=object_type,
+                        object_id=next(iter(request.path_params.values()), None),
+                    )
+                    if action
+                    else None
+                )
+                request.state.identity_event = record
+                external_audit = bool(action and action.startswith(("instance.", "config.", "audit.")))
+                if external_audit:
+                    await state.audit.begin_person(record)
+                try:
+                    # 审计兜底可能完成落库；取消的请求不能继续触发外部副作用。
+                    raise_if_cancelled()
+                    response = await handler(request)
+                except asyncio.CancelledError:
+                    if external_audit:
+                        record.update(status="cancelled", error="请求取消，外部操作结果未知")
+                        await state.audit.finish_person(record)
+                    raise
+                except IdentityError as exc:
+                    response = JSONResponse({"detail": str(exc)}, status_code=400)
+                except ConfigError:
+                    # Pydantic validation messages can contain submitted secrets.
+                    response = JSONResponse(
+                        {"detail": "配置校验失败，请检查字段、环境变量与凭据类型"}, status_code=400
+                    )
+                except (OSError, ValueError, TypeError, KeyError):
+                    response = JSONResponse(
+                        {"detail": "操作失败，请检查输入、文件权限与服务日志"}, status_code=400
+                    )
+                except Exception as exc:  # noqa: BLE001 - keep audit and sanitized failure response
+                    logging.getLogger(__name__).error("管理操作失败: %s", type(exc).__name__)
+                    response = JSONResponse(
+                        {"detail": "服务暂时无法完成操作，请稍后重试"}, status_code=500
+                    )
+                if record:
+                    if response.status_code >= 400:
+                        record["status"] = "error"
+                        record["error"] = "操作未完成（请求被拒绝或参数无效）"
+                    if (
+                        getattr(request.state, "attempted_username", None)
+                        and record["username"] is None
+                    ):
+                        record["username"] = request.state.attempted_username
+                    # Identity mutations have a transactional outbox. Others are written directly.
+                    if external_audit:
+                        await state.audit.finish_person(record)
+                    elif not getattr(request.state, "outbox_recorded", False):
+                        await state.audit.log_person(record)
+                    await state.flush_identity_events()
+                # 副作用已完成时保留其真实审计结果，但仍传播请求取消。
+                raise_if_cancelled()
+                response.headers["Cache-Control"] = "no-store"
+                response.headers["X-Request-ID"] = request.state.request_id
+                return response
+
+            mcp.custom_route(path, methods=methods)(wrapped)
+            return wrapped
+
+        return decorate
+
+    def set_session(response, value):
+        auth = state.config.auth
+        response.set_cookie(
+            _COOKIE,
+            value,
+            max_age=auth.session_hours * 3600,
+            httponly=True,
+            secure=auth.cookie_secure,
+            samesite="strict",
+            path=auth.cookie_path,
+        )
+
+    @route("/", ["GET"], public=True)
+    async def index(request):
         if not _INDEX_HTML.is_file():
-            # 前端产物未入库（未跑 npm run build）：给出可读提示而不是裸 500
-            return JSONResponse(
-                {"detail": "前端产物缺失，请在 webui/ 下执行 npm run build"}, status_code=503
-            )
+            return JSONResponse({"detail": "前端产物缺失，请构建 webui"}, status_code=503)
         return FileResponse(_INDEX_HTML)
 
-    @mcp.custom_route("/assets/{path:path}", methods=["GET"])
-    async def assets(request: Request) -> FileResponse | JSONResponse:
-        rel = request.path_params["path"]
-        file = (_STATIC_DIR / "assets" / rel).resolve()
-        if not file.is_relative_to(_STATIC_DIR.resolve()) or not file.is_file():
+    @route("/assets/{path:path}", ["GET"], public=True)
+    async def assets(request):
+        file = (_STATIC_DIR / "assets" / request.path_params["path"]).resolve()
+        if not file.is_relative_to((_STATIC_DIR / "assets").resolve()) or not file.is_file():
             return JSONResponse({"detail": "not found"}, status_code=404)
         return FileResponse(file)
 
-    @mcp.custom_route("/healthz", methods=["GET"])
-    async def healthz(request: Request) -> JSONResponse:
+    @route("/healthz", ["GET"], public=True)
+    async def healthz(request):
         return JSONResponse({"ok": True})
 
-    @mcp.custom_route("/api/me", methods=["GET"])
-    async def me(request: Request) -> JSONResponse:
-        user, error = authenticate(request)
-        if error is not None:
-            return error
+    @route("/api/auth/status", ["GET"], public=True)
+    async def auth_status(request):
         return JSONResponse(
-            {
-                "username": user.username,
-                "admin": user.admin,
-                "default_admin": state.config.auth.using_default_admin,
-            }
+            {"setup_required": await asyncio.to_thread(lambda: state.identity.setup_required)}
         )
 
-    @mcp.custom_route("/api/instances", methods=["GET"])
-    async def list_instances(request: Request) -> JSONResponse:
-        _, error = authenticate(request)
-        if error is not None:
-            return error
-        return JSONResponse(
-            {
-                "instances": [
-                    _instance_payload(name, inst)
-                    for name, inst in state.config.instances.items()
-                ]
-            }
+    @route("/api/auth/setup", ["POST"], action="user.initialize", public=True, object_type="user")
+    async def setup(request):
+        value = await read_body(request)
+        user = await asyncio.to_thread(
+            state.identity.initialize,
+            value.get("username", ""),
+            value.get("password", ""),
+            value.get("setup_key", ""),
+            request.state.identity_event,
         )
+        request.state.outbox_recorded = True
+        request.state.user = user
+        user, session, csrf = await asyncio.to_thread(
+            state.identity.login, user["username"], value["password"]
+        )
+        response = JSONResponse({"user": user, "csrf_token": csrf}, status_code=201)
+        set_session(response, session)
+        return response
 
-    # 注意：先注册 /api/instances/test，避免被 {name} 路由吞掉
-    @mcp.custom_route("/api/instances/test", methods=["POST"])
-    async def test_instance(request: Request) -> JSONResponse:
-        _, error = require_admin(request)
-        if error is not None:
-            return error
+    @route("/api/auth/login", ["POST"], action="user.login", public=True, object_type="user")
+    async def login(request):
+        value = await read_body(request)
+        username = value.get("username", "")
+        username = username.strip() if isinstance(username, str) else username
+        request.state.attempted_username = username[:128] if isinstance(username, str) else None
+        if not isinstance(username, str) or not isinstance(value.get("password"), str):
+            raise IdentityError("用户名或密码错误")
         try:
-            body = sanitize_instance_entry(await request.json())
-            if "password" not in body:
-                # 编辑模式留空密码：测试时沿用该实例已保存的密码
-                existing = state.config.get_instance(str(body.get("name") or ""))
-                if existing is not None:
-                    body["password"] = existing.password.get_secret_value()
-            inst = _validate_instance(body)
-        except ConfigError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-        except Exception as exc:  # noqa: BLE001 - 测试连接：把任何异常转成可读结果
-            return JSONResponse({"ok": False, "error": f"配置无效: {exc}"}, status_code=400)
+            user, session, csrf = await asyncio.to_thread(
+                state.identity.login, username, value["password"], request.state.identity_event
+            )
+        except IdentityError:
+            return JSONResponse({"detail": "用户名或密码错误"}, status_code=401)
+        request.state.outbox_recorded = True
+        response = JSONResponse({"user": user, "csrf_token": csrf})
+        set_session(response, session)
+        return response
 
+    @route("/api/me", ["GET"])
+    async def me(request):
+        return JSONResponse({"user": request.state.user, "csrf_token": request.state.csrf_token})
+
+    @route("/api/auth/logout", ["POST"], action="user.logout", object_type="session")
+    async def logout(request):
+        await asyncio.to_thread(
+            state.identity.logout, request.cookies.get(_COOKIE, ""), request.state.identity_event
+        )
+        request.state.outbox_recorded = True
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(_COOKIE, path=state.config.auth.cookie_path)
+        return response
+
+    @route("/api/users", ["GET"])
+    async def list_users(request):
+        return JSONResponse({"users": await asyncio.to_thread(state.identity.list_users)})
+
+    @route("/api/users", ["POST"], action="user.create", object_type="user")
+    async def create_user(request):
+        value = await read_body(request)
+        item = await asyncio.to_thread(
+            state.identity.create_user,
+            value.get("username", ""),
+            value.get("password", ""),
+            value.get("display_name", ""),
+            request.state.identity_event,
+        )
+        request.state.outbox_recorded = True
+        return JSONResponse(item, status_code=201)
+
+    @route("/api/users/{id}", ["PATCH"], action="user.update", object_type="user")
+    async def update_user(request):
+        value = await read_body(request)
+        changes = {k: v for k, v in value.items() if k in {"display_name", "password", "enabled"}}
+        request.state.identity_event["summary"] = ", ".join(
+            "密码已更换" if k == "password" else k for k in changes
+        )
+        item = await asyncio.to_thread(
+            state.identity.update_user,
+            request.path_params["id"],
+            changes,
+            request.state.identity_event,
+        )
+        request.state.outbox_recorded = True
+        return JSONResponse(item)
+
+    @route("/api/tokens", ["GET"])
+    async def list_tokens(request):
+        return JSONResponse({"tokens": await asyncio.to_thread(state.identity.list_tokens)})
+
+    @route("/api/tokens", ["POST"], action="token.create", object_type="token")
+    async def create_token(request):
+        value = await read_body(request)
+        token, item = await asyncio.to_thread(
+            state.identity.create_token,
+            value.get("name", ""),
+            request.state.user["id"],
+            value.get("description", ""),
+            request.state.identity_event,
+        )
+        request.state.outbox_recorded = True
+        return JSONResponse({"token": token, "item": item}, status_code=201)
+
+    @route("/api/tokens/{id}", ["PATCH"], action="token.update", object_type="token")
+    async def update_token(request):
+        value = await read_body(request)
+        changes = {k: v for k, v in value.items() if k in {"name", "description", "enabled"}}
+        request.state.identity_event["summary"] = ", ".join(changes)
+        item = await asyncio.to_thread(
+            state.identity.update_token,
+            request.path_params["id"],
+            changes,
+            request.state.identity_event,
+        )
+        request.state.outbox_recorded = True
+        return JSONResponse(item)
+
+    @route("/api/tokens/{id}", ["DELETE"], action="token.revoke", object_type="token")
+    async def revoke_token(request):
+        await asyncio.to_thread(
+            state.identity.revoke_token, request.path_params["id"], request.state.identity_event
+        )
+        request.state.outbox_recorded = True
+        return JSONResponse({"ok": True})
+
+
+    @route("/api/instances", ["GET"])
+    async def list_instances(request):
+        return JSONResponse({"instances": [
+            _instance_payload(name, inst) for name, inst in state.config.instances.items()
+        ]})
+
+    # 注册在动态名称路由之前；测试连接不修改连接池或持久化配置。
+    @route("/api/instances/test", ["POST"], action="instance.test", object_type="instance")
+    async def test_instance(request):
+        value = await read_body(request)
+        name = str(value.get("name") or "").strip()
+        request.state.identity_event["object_id"] = name or None
+        body = sanitize_instance_entry(value)
+        existing = state.config.get_instance(name)
+        inst = _validate_instance(body)
+        if existing is not None and not body.get("password"):
+            # 已存密码已完成环境变量解析，不可再展开其中的 $$/\${...}。
+            inst = inst.model_copy(update={"password": existing.password})
+        secrets = tuple(filter(None, (inst.password.get_secret_value(),)))
         conn = None
         try:
-            conn = await asyncio.wait_for(
-                state.pool.connect_one_shot(inst), timeout=_TEST_TIMEOUT
-            )
+            conn = await asyncio.wait_for(state.pool.connect_one_shot(inst), timeout=_TEST_TIMEOUT)
             if isinstance(inst, PostgresInstance):
                 async with conn.acquire() as c:
-                    await c.fetchval("SELECT 1")
+                    await asyncio.wait_for(c.fetchval("SELECT 1"), timeout=_TEST_TIMEOUT)
             else:
-                await conn.ping()
-            return JSONResponse({"ok": True, "message": "连接成功"})
-        except DbMcpError as exc:
-            return JSONResponse({"ok": False, "error": str(exc)})
+                await asyncio.wait_for(conn.ping(), timeout=_TEST_TIMEOUT)
         except asyncio.TimeoutError:
+            request.state.identity_event.update(status="timeout", error="连接测试超时")
             return JSONResponse({"ok": False, "error": f"连接超时（{_TEST_TIMEOUT}s）"})
-        except Exception as exc:  # noqa: BLE001 - 测试连接：把任何异常转成可读结果
-            return JSONResponse({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+        except DbMcpError as exc:
+            error = redact(str(exc), secrets)
+            request.state.identity_event.update(status="error", error=error)
+            return JSONResponse({"ok": False, "error": error})
+        except Exception:  # noqa: BLE001 - 驱动异常统一脱敏并记录失败结果
+            request.state.identity_event.update(status="error", error="连接失败，请检查地址与凭据")
+            return JSONResponse({"ok": False, "error": "连接失败，请检查地址、凭据与网络"})
         finally:
             if conn is not None:
                 await state.pool.close_one_shot(conn)
+        return JSONResponse({"ok": True, "message": "连接成功"})
 
-    @mcp.custom_route("/api/instances", methods=["POST"])
-    async def create_instance(request: Request) -> JSONResponse:
-        _, error = require_admin(request)
-        if error is not None:
-            return error
-        try:
-            body = await request.json()
-        except Exception:  # noqa: BLE001 - 请求体非 JSON
-            return JSONResponse({"detail": "请求体不是合法 JSON"}, status_code=400)
+    @route("/api/instances", ["POST"], action="instance.create", object_type="instance")
+    async def create_instance(request):
+        body = await read_body(request)
         name = str(body.get("name") or "").strip()
         if not name:
-            return JSONResponse({"detail": "缺少实例名 name"}, status_code=400)
-        try:
-            config = await state.upsert_instance(name, body)
-        except ConfigError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=400)
-        except OSError as exc:
-            # 权限不足 / 磁盘满 / 挂载不可写等：给出可读原因而不是 500
-            return JSONResponse({"detail": f"配置文件写入失败: {exc}"}, status_code=500)
-        inst = config.get_instance(name)
-        if inst is None:  # pragma: no cover - upsert 成功后必然存在
-            return JSONResponse({"detail": "保存后未找到实例"}, status_code=500)
-        return JSONResponse(_instance_payload(name, inst), status_code=201)
+            raise IdentityError("缺少实例名 name")
+        request.state.identity_event["object_id"] = name
+        request.state.identity_event["summary"] = "创建数据库实例（凭据不记录）"
+        config = await state.upsert_instance(name, body, create_only=True)
+        return JSONResponse(_instance_payload(name, config.get_instance(name)), status_code=201)
 
-    @mcp.custom_route("/api/instances/{name}", methods=["PUT"])
-    async def update_instance(request: Request) -> JSONResponse:
-        _, error = require_admin(request)
-        if error is not None:
-            return error
+    @route("/api/instances/{name}", ["PUT"], action="instance.update", object_type="instance")
+    async def update_instance(request):
         name = request.path_params["name"]
         if state.config.get_instance(name) is None:
-            return JSONResponse({"detail": f"实例 {name!r} 不存在"}, status_code=404)
-        try:
-            body = await request.json()
-            config = await state.upsert_instance(name, body)
-        except ConfigError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=400)
-        except OSError as exc:
-            return JSONResponse({"detail": f"配置文件写入失败: {exc}"}, status_code=500)
-        inst = config.get_instance(name)
-        if inst is None:  # pragma: no cover
-            return JSONResponse({"detail": "保存后未找到实例"}, status_code=500)
-        return JSONResponse(_instance_payload(name, inst))
+            return JSONResponse({"detail": "实例不存在"}, status_code=404)
+        body = await read_body(request)
+        request.state.identity_event["summary"] = "更新数据库实例" + (
+            "，密码已更换" if body.get("password") else "，保留原凭据"
+        )
+        config = await state.upsert_instance(name, body)
+        return JSONResponse(_instance_payload(name, config.get_instance(name)))
 
-    @mcp.custom_route("/api/instances/{name}", methods=["DELETE"])
-    async def delete_instance(request: Request) -> JSONResponse:
-        _, error = require_admin(request)
-        if error is not None:
-            return error
+    @route("/api/instances/{name}", ["DELETE"], action="instance.delete", object_type="instance")
+    async def delete_instance(request):
         name = request.path_params["name"]
         if state.config.get_instance(name) is None:
-            return JSONResponse({"detail": f"实例 {name!r} 不存在"}, status_code=404)
-        try:
-            await state.delete_instance(name)
-        except OSError as exc:
-            return JSONResponse({"detail": f"配置文件写入失败: {exc}"}, status_code=500)
+            return JSONResponse({"detail": "实例不存在"}, status_code=404)
+        await state.delete_instance(name)
         return JSONResponse({"ok": True})
 
-    @mcp.custom_route("/api/audit", methods=["GET"])
-    async def audit_query(request: Request) -> JSONResponse:
-        _, error = authenticate(request)
-        if error is not None:
-            return error
+    @route("/api/config-raw", ["GET"], action="config.export", object_type="config")
+    async def config_raw(request):
+        # 只导出脱敏副本，旧 auth.users 中的 token 也不能重新暴露。
+        from copy import deepcopy
+
+        import yaml
+
+        raw = deepcopy(state.cfg_file.raw)
+        for instance in raw.get("instances", {}).values():
+            if "password" in instance:
+                instance["password"] = "[REDACTED]"
+        raw.get("auth", {}).pop("users", None)
+        return Response(
+            yaml.safe_dump(raw, allow_unicode=True, sort_keys=False),
+            media_type="application/x-yaml; charset=utf-8",
+            headers={"Content-Disposition": 'attachment; filename="config-redacted.yaml"'},
+        )
+
+    @route("/api/audit", ["GET"])
+    async def audit_query(request):
         qp = request.query_params
         try:
             limit = min(max(1, int(qp.get("limit", "20"))), 200)
-        except ValueError:
-            limit = 20
-        try:
             offset = max(0, int(qp.get("offset", "0")))
         except ValueError:
-            offset = 0
-        filters = _audit_filters(qp)
-        records, total = state.audit.query(limit=limit, offset=offset, **filters)
-        return JSONResponse(
-            {"records": records, "total": total, "limit": limit, "offset": offset}
+            raise IdentityError("分页参数必须是整数") from None
+        records, total = await asyncio.to_thread(
+            state.audit.query, limit=limit, offset=offset, **_audit_filters(qp)
         )
+        return JSONResponse({"records": records, "total": total, "limit": limit, "offset": offset})
 
-    @mcp.custom_route("/api/audit/export", methods=["GET"])
-    async def audit_export(request: Request) -> Response:
-        _, error = authenticate(request)
-        if error is not None:
-            return error
-        rows = state.audit.export_rows(**_audit_filters(request.query_params))
-        columns = [
-            "ts", "user", "tool", "instance", "kind", "status", "duration_ms",
-            "statement", "statement_truncated", "row_count", "error", "request_id",
-        ]
+    @route("/api/audit/export", ["GET"], action="audit.export", object_type="audit")
+    async def audit_export(request):
+        filters = _audit_filters(request.query_params)
+        rows = await asyncio.to_thread(state.audit.export_rows, **filters)
+        fields = (
+            [
+                "event_id",
+                "ts",
+                "actor_user_id",
+                "username",
+                "action",
+                "object_type",
+                "object_id",
+                "summary",
+                "status",
+                "error",
+                "request_id",
+                "source_ip",
+            ]
+            if filters["kind"] == "person"
+            else [
+                "id",
+                "ts",
+                "token_id",
+                "token_name",
+                "token_prefix",
+                "tool",
+                "kind",
+                "user",
+                "instance",
+                "target_type",
+                "target_host",
+                "target_port",
+                "target_username",
+                "target_database",
+                "statement",
+                "statement_truncated",
+                "row_count",
+                "result_truncated",
+                "status",
+                "duration_ms",
+                "error",
+                "request_id",
+                "source_ip",
+            ]
+        )
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(columns)
-        for r in rows:
-            writer.writerow([_csv_cell(r.get(k)) for k in columns])
-        # BOM 让 Excel 正确识别 UTF-8 中文
-        body = "﻿" + buf.getvalue()
-        filename = f"audit-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}.csv"
+        writer.writerow(fields)
+        writer.writerows([_csv_cell(row.get(key)) for key in fields] for row in rows)
         return Response(
-            body,
+            "\ufeff" + buf.getvalue(),
             media_type="text/csv; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-
-    @mcp.custom_route("/api/users", methods=["GET"])
-    async def list_users(request: Request) -> JSONResponse:
-        _, error = require_admin(request)
-        if error is not None:
-            return error
-        # 返回 token 配置原文：${ENV} 引用显示引用本身，不展开真实值
-        raw_users = state.cfg_file.raw.get("auth", {}).get("users", [])
-        if raw_users:
-            users = [
-                {
-                    "username": str(u.get("username") or ""),
-                    "admin": bool(u.get("admin")),
-                    "token": str(u.get("token") or ""),
-                }
-                for u in raw_users
-            ]
-        else:
-            # 配置里还没写 auth（使用内置默认账号）：展示当前生效的成员，便于直接改名/换 token
-            users = [
-                {
-                    "username": u.username,
-                    "admin": u.admin,
-                    "token": u.token.get_secret_value(),
-                }
-                for u in state.config.auth.users
-            ]
-        return JSONResponse({"users": users})
-
-    @mcp.custom_route("/api/users", methods=["PUT"])
-    async def update_users(request: Request) -> JSONResponse:
-        _, error = require_admin(request)
-        if error is not None:
-            return error
-        body = await request.json()
-        users = body.get("users")
-        if not isinstance(users, list):
-            return JSONResponse({"detail": "users 应为列表"}, status_code=400)
-        try:
-            config = await asyncio.to_thread(state.cfg_file.update_users, users)
-        except ConfigError as exc:
-            return JSONResponse({"detail": str(exc)}, status_code=400)
-        except OSError as exc:
-            return JSONResponse({"detail": f"配置文件写入失败: {exc}"}, status_code=500)
-        except Exception as exc:  # noqa: BLE001 - 用户管理：任何异常转成可读错误
-            return JSONResponse({"detail": f"保存失败: {exc}"}, status_code=400)
-        state.replace_config(config)
-        return JSONResponse({"ok": True})
-
-    @mcp.custom_route("/api/config-raw", methods=["GET"])
-    async def config_raw(request: Request) -> Response:
-        """导出配置文件原文（凭据为 ${ENV} 引用原文，不含真实密码）。仅 admin。"""
-        _, error = require_admin(request)
-        if error is not None:
-            return error
-        import yaml
-
-        text = yaml.safe_dump(state.cfg_file.raw, allow_unicode=True, sort_keys=False)
-        return Response(
-            text,
-            media_type="application/x-yaml; charset=utf-8",
-            headers={"Content-Disposition": 'attachment; filename="config.yaml"'},
+            headers={"Content-Disposition": f'attachment; filename="audit-{filters["kind"]}.csv"'},
         )
 
 
 def _validate_instance(body: dict[str, Any]) -> InstanceConfig:
-    """把网页提交的表单校验成实例配置对象（用于测试连接）。"""
     from pydantic import TypeAdapter
 
     adapter: TypeAdapter[InstanceConfig] = TypeAdapter(InstanceConfig)

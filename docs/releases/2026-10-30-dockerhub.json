@@ -1,0 +1,27 @@
+{
+  "published_at": "2026-10-30T11:01:09.382849+00:00",
+  "repository": "lijx559/db-mcp",
+  "version": "2.1.0",
+  "tags": [
+    "2.1.0",
+    "latest"
+  ],
+  "public": true,
+  "index_digest": "sha256:bf50ceda7ef5a4678b543efe2253194658509c655dca505327bd3efb1255f9cc",
+  "base_index_digest": "sha256:aa943ce411423c7582288f18707ff66eddcbaeb510502d747a72aeb34f30d159",
+  "source_revision": "c97ce44cfbca219a7d4da710092801dd229176e1",
+  "source_dirty": true,
+  "source_fingerprint": "0871d51edb736f90b5915fb4f306cf2abf905017f17ba461df5fee39425411b2",
+  "images": [
+    {
+      "platform": "linux/amd64",
+      "manifest_digest": "sha256:6ae63734e37e7832318dd725d02e93bc20ba75a50c90cfe6824a192fca25acdd",
+      "config_digest": "sha256:47515b758e9c866b82f33c69cf4c06d67f57da8c22fca2c72ad03624d5e88121"
+    },
+    {
+      "platform": "linux/arm64",
+      "manifest_digest": "sha256:4c80aab48d5afee0f674d514aaf5794bfc90b48b8c5580909a504cd11d5f12e0",
+      "config_digest": "sha256:3d7c125b4ca72e31bc6437a3f7e45b8db1485ae9582c559b233540a2d842b57b"
+    }
+  ]
+}

@@ -21,7 +21,6 @@ import yaml
 from pydantic import (
     BaseModel,
     Field,
-    PrivateAttr,
     SecretStr,
     field_validator,
     model_validator,
@@ -60,12 +59,8 @@ def expand_env_vars(node: Any) -> Any:
 
 
 class ListenerConfig(BaseModel):
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8807
-
-
-DEFAULT_ADMIN_USERNAME = "admin"
-DEFAULT_ADMIN_TOKEN = "admin"
 
 
 class UserEntry(BaseModel):
@@ -75,30 +70,22 @@ class UserEntry(BaseModel):
 
 
 class AuthConfig(BaseModel):
+    # users 仅用于旧 MCP token 的一次性迁移，不再是网页人员账号。
     users: list[UserEntry] = Field(default_factory=list)
-    _using_default_admin: bool = PrivateAttr(default=False)
+    database: Path = Path("data/service.db")
+    session_hours: int = Field(default=8, ge=1, le=168)
+    cookie_secure: bool = False
+    cookie_path: str = "/"
 
     @model_validator(mode="after")
     def _ensure_users(self) -> AuthConfig:
-        if not self.users:
-            # 未配置任何成员：内置默认管理员，保证首次启动能进入管理端配置其他成员
-            self.users = [
-                UserEntry(
-                    username=DEFAULT_ADMIN_USERNAME,
-                    token=DEFAULT_ADMIN_TOKEN,
-                    admin=True,
-                )
-            ]
-            self._using_default_admin = True
         names = [u.username for u in self.users]
         if len(names) != len(set(names)):
             raise ValueError("auth.users 中存在重复的 username")
+        if not self.cookie_path.startswith("/") or not self.cookie_path.endswith("/"):
+            raise ValueError("auth.cookie_path 必须以 / 开始和结束")
         return self
 
-    @property
-    def using_default_admin(self) -> bool:
-        """当前是否在使用内置默认管理员账号（admin/admin）。"""
-        return self._using_default_admin
 
 
 class AuditConfig(BaseModel):
@@ -188,7 +175,7 @@ class GatewayConfig(BaseModel):
         """掩码密码的配置摘要，用于调试输出。"""
         lines = [
             f"监听 {self.server.host}:{self.server.port}",
-            f"用户 {len(self.auth.users)} 个: {', '.join(u.username for u in self.auth.users)}",
+            f"旧 MCP 凭证 {len(self.auth.users)} 个（仅用于首次迁移）",
             f"审计日志 {self.audit.path}",
         ]
         for name, inst in self.instances.items():
@@ -237,7 +224,13 @@ class ConfigFile:
 
     def load(self) -> GatewayConfig:
         try:
-            return GatewayConfig.model_validate(expand_env_vars(deepcopy(self.raw)))
+            config = GatewayConfig.model_validate(expand_env_vars(deepcopy(self.raw)))
+            base = self.path.resolve().parent
+            if not config.auth.database.is_absolute():
+                config.auth.database = base / config.auth.database
+            if not config.audit.path.is_absolute():
+                config.audit.path = base / config.audit.path
+            return config
         except ConfigError:
             raise
         except Exception as exc:
@@ -252,36 +245,6 @@ class ConfigFile:
         )
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.path)
-
-    def update_users(self, users: list[dict[str, Any]]) -> GatewayConfig:
-        """整体替换 auth.users。token 提交什么就存什么（含 ${ENV} 引用原文）。"""
-        cleaned: list[dict[str, Any]] = []
-        for u in users:
-            username = str(u.get("username") or "").strip()
-            token = str(u.get("token") or "").strip()
-            if not username:
-                raise ConfigError("用户名不能为空")
-            if not token:
-                raise ConfigError(f"用户 {username} 的 token 不能为空")
-            entry: dict[str, Any] = {"username": username, "token": token}
-            if u.get("admin"):
-                entry["admin"] = True
-            cleaned.append(entry)
-        if not cleaned:
-            raise ConfigError("至少要保留一个成员")
-        names = [u["username"] for u in cleaned]
-        dups = sorted({n for n in names if names.count(n) > 1})
-        if dups:
-            raise ConfigError(f"用户名重复: {', '.join(dups)}")
-        snapshot = deepcopy(self.raw)
-        self.raw.setdefault("auth", {})["users"] = cleaned
-        try:
-            config = self.load()
-        except Exception:
-            self.raw = snapshot
-            raise
-        self.save()
-        return config
 
     def upsert_instance(self, name: str, entry: dict[str, Any]) -> GatewayConfig:
         """新增或更新一个数据库实例；校验失败会回滚内存中的原始树。"""
@@ -299,10 +262,10 @@ class ConfigFile:
                 entry = {**entry, "password": existing.get("password", "")}
             instances[name] = entry
             config = self.load()
+            self.save()
         except Exception:
             self.raw["instances"] = snapshot
             raise
-        self.save()
         return config
 
     def delete_instance(self, name: str) -> GatewayConfig:
@@ -313,8 +276,8 @@ class ConfigFile:
         try:
             del instances[name]
             config = self.load()
+            self.save()
         except Exception:
             self.raw["instances"] = snapshot
             raise
-        self.save()
         return config

@@ -19,6 +19,7 @@ from typing import Any, TypeVar
 import asyncpg
 import redis.asyncio as aioredis
 
+from ..audit import raise_if_cancelled, record_attempt, record_target
 from ..config import (
     GatewayConfig,
     PostgresInstance,
@@ -44,6 +45,8 @@ class ConnectionPool:
         self._config_fn = config_fn
         self._pg: dict[str, Any] = {}
         self._redis: dict[str, Any] = {}
+        self._pg_signatures: dict[str, dict[str, Any]] = {}
+        self._redis_signatures: dict[str, dict[str, Any]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._sems: dict[str, asyncio.Semaphore] = {}
 
@@ -118,18 +121,32 @@ class ConnectionPool:
 
     async def get_pg_pool(self, name: str, inst: PostgresInstance) -> Any:
         async with self._lock(f"pg:{name}"):
+            signature = inst.model_dump()
             pool = self._pg.get(name)
+            if pool is not None and self._pg_signatures.get(name) != signature:
+                self._pg.pop(name, None)
+                self._pg_signatures.pop(name, None)
+                await _close_quietly(pool)
+                pool = None
             if pool is None:
                 pool = await self._connect_pg(name, inst)
                 self._pg[name] = pool
+                self._pg_signatures[name] = signature
             return pool
 
     async def get_redis_client(self, name: str, inst: RedisInstance) -> Any:
         async with self._lock(f"redis:{name}"):
+            signature = inst.model_dump()
             client = self._redis.get(name)
+            if client is not None and self._redis_signatures.get(name) != signature:
+                self._redis.pop(name, None)
+                self._redis_signatures.pop(name, None)
+                await _close_quietly(client)
+                client = None
             if client is None:
                 client = await self._connect_redis(name, inst)
                 self._redis[name] = client
+                self._redis_signatures[name] = signature
             return client
 
     async def connect_one_shot(self, inst: PostgresInstance | RedisInstance) -> Any:
@@ -144,9 +161,11 @@ class ConnectionPool:
     async def invalidate(self, name: str) -> None:
         """配置变化或连接失效时丢弃缓存；下次调用会重建。"""
         pool = self._pg.pop(name, None)
+        self._pg_signatures.pop(name, None)
         if pool is not None:
             await _close_quietly(pool)
         client = self._redis.pop(name, None)
+        self._redis_signatures.pop(name, None)
         if client is not None:
             await _close_quietly(client)
 
@@ -155,6 +174,8 @@ class ConnectionPool:
         clients = list(self._redis.values())
         self._pg.clear()
         self._redis.clear()
+        self._pg_signatures.clear()
+        self._redis_signatures.clear()
         for obj in [*pools, *clients]:
             await _close_quietly(obj)
 
@@ -163,18 +184,33 @@ class ConnectionPool:
     ) -> T:
         """在缓存连接上执行操作；遇连接级错误则失效重连再试一次。"""
         async with self._semaphore(name):
-            conn = await self._get(name, inst)
-            try:
-                return await op(conn)
-            except _RETRYABLE:
-                await self.invalidate(name)
-                conn = await self._get(name, inst)
+            await record_target(inst)
+            for attempt in (1, 2):
                 try:
-                    return await op(conn)
-                except _RETRYABLE as exc2:
-                    raise ConnectionFailedError(
-                        f"在实例 {name!r} 上操作失败（重连后仍失败）: {exc2}"
-                    ) from exc2
+                    await record_attempt(attempt, "running")
+                    raise_if_cancelled()
+                    conn = await self._get(name, inst)
+                    raise_if_cancelled()
+                    result = await op(conn)
+                    raise_if_cancelled()
+                except asyncio.CancelledError:
+                    await record_attempt(attempt, "cancelled", "请求已取消；数据库结果未知")
+                    raise
+                except _RETRYABLE as exc:
+                    await record_attempt(attempt, "error", f"{type(exc).__name__}: {exc}")
+                    if attempt == 2:
+                        raise ConnectionFailedError(
+                            f"在实例 {name!r} 上操作失败（重连后仍失败）: {exc}"
+                        ) from exc
+                    await self.invalidate(name)
+                except Exception as exc:
+                    status = "timeout" if "timeout" in type(exc).__name__.lower() else "error"
+                    await record_attempt(attempt, status, f"{type(exc).__name__}: {exc}")
+                    raise
+                else:
+                    await record_attempt(attempt, "ok")
+                    return result
+        raise RuntimeError("数据库重试流程未产生结果")  # pragma: no cover
 
     async def _get(self, name: str, inst: PostgresInstance | RedisInstance) -> Any:
         if isinstance(inst, PostgresInstance):
