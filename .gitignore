@@ -29,3 +29,6 @@ keys/
 
 # 系统
 .DS_Store
+
+# Local deployment backups
+backups/

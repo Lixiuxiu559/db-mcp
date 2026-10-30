@@ -1,0 +1,4 @@
+services:
+  db-mcp:
+    build:
+      context: .

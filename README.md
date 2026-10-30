@@ -1,139 +1,131 @@
-# db-mcp — 数据库链路工作台
+<div align="center">
 
-基于 Python FastMCP 的独立 PostgreSQL / Redis 网关。2.1.0 管理端采用 Linkage 1.0 统一设计，网页人员、MCP token 和双审计独立管理。
+# DB MCP
 
-## 本地启动
+**让 AI 连接数据库，也让每次数据操作有迹可循。**
 
-需要 Python 3.10+ 与 uv，默认只监听本机 127.0.0.1:8807。
+[![Docker Hub](https://img.shields.io/badge/Docker_Hub-2.1.0-146ED0?logo=docker&logoColor=white)](https://hub.docker.com/r/lijx559/db-mcp)
+[![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-4B5FC4)](docs/releases/2026-10-30-dockerhub.md)
+[![FastMCP](https://img.shields.io/badge/FastMCP-4.1.4-17242B)](https://gofastmcp.com)
+
+**简体中文** · [English](README.en.md)
+
+[产品能力](#features) · [Docker Compose 部署](#deploy) · [MCP 接入](#connect) · [运维](#operations)
+
+</div>
+
+面向 PostgreSQL 与 Redis 的自托管 MCP 网关。集中管理连接与凭据，按实例控制只读/读写边界，通过一个工作台查看配置操作和数据库调用。
+
+![DB MCP 工作台演示](docs/images/workspace.png)
+
+<sub>截图来自独立演示环境，不包含真实生产资源或凭据。</sub>
+
+<a id="features"></a>
+
+## 产品能力
+
+| 能力 | 你可以做什么 |
+|---|---|
+| 多实例管理 | 统一维护 PostgreSQL、Redis 连接，支持连通性测试与配置热更新。 |
+| 数据操作 | 31 个 MCP 工具覆盖 SQL 查询、表结构浏览及 Redis 常用数据类型。 |
+| 读写边界 | 实例默认只读；PostgreSQL 叠加工具权限、SQL 静态分析与只读事务。 |
+| 危险操作确认 | 高危 DDL 需要 `confirm=true`，保留显式确认入口。 |
+| 独立凭证与双审计 | 人员登录与 MCP token 分离；追踪实际数据库目标，默认保留 30 天。 |
+| 统一工作台 | Linkage 界面、三态主题、命令面板与响应式表格。 |
+
+<a id="deploy"></a>
+
+## Docker Compose 部署
+
+需要 Docker Engine（或 Docker Desktop）与 Docker Compose v2。无需克隆源码，镜像已包含完整管理页面。部署机器需要能访问目标数据库。
+
+### 1. 准备部署目录
+
+以下命令适用于 Linux/macOS 普通用户。`.env` 会保存端口、镜像和运行 UID/GID；后续重启继续使用相同配置。
 
 ```bash
-uv sync --locked
-uv run --locked db-mcp --init --config ./runtime/config.yaml
-uv run --locked db-mcp --config ./runtime/config.yaml
+mkdir -p db-mcp/runtime
+cd db-mcp
+umask 077
+cat > .env <<EOF
+COMPOSE_PROJECT_NAME=db-mcp
+DOCKER_UID=$(id -u)
+DOCKER_GID=$(id -g)
+DBMCP_IMAGE=lijx559/db-mcp:2.1.0
+DBMCP_BIND_ADDRESS=127.0.0.1
+DBMCP_PORT=8807
+TZ=Asia/Shanghai
+EOF
 ```
 
-打开 http://127.0.0.1:8807/。首次启动从终端提示的本机 `setup.key` 文件读取一次性初始化码，设置用户名与密码；没有默认登录账号。
-`--init` 仅创建最小空配置，不覆盖已有文件。可选 `--host`、`--port`、`--data-dir`，后者显式覆盖身份和审计数据位置，不自动迁移数据。
+若以 root 部署，在 `.env` 中把 `DOCKER_UID` / `DOCKER_GID` 设为专用非 root 账号的 UID/GID，并将 `runtime/` 属主调整为相同值，例如 `chown -R 1000:1000 runtime`。镜像默认使用 UID/GID `1000:1000`。
 
-## 人员与 MCP token
+### 2. 保存 `docker-compose.yml`
 
-- 网页以用户名和密码登录，所有启用人员同权；提供用户创建、显示名修改、密码重置与启停。不能停用最后一个可登录人员。
-- 密码采用带盐 scrypt 哈希，网页使用可撤销的 HttpOnly Cookie 会话（默认 8 小时）及写操作 CSRF 校验。账号停用、密码变化撤销其会话。
-- MCP token 在独立页面创建、命名、备注、启停、吊销，查看创建人和最近调用时间，生成客户端接入配置。新 token 只展示一次明文；服务仅保存验证哈希。
-- MCP token 仅用于 `/mcp`，不能登录网页；网页登录会话不能调用 MCP。
-- 重启、升级和容器重建保留 token，创建新 token 不自动使旧 token 失效。人员停用也不自动吊销其创建的 token，需独立处理。
-- 数据库实例的 `read` / `write` 权限与高危 SQL 确认继续生效，与网页人员同权相互独立。
+```yaml
+name: db-mcp
+services:
+  db-mcp:
+    image: ${DBMCP_IMAGE:-lijx559/db-mcp:2.1.0}
+    restart: unless-stopped
+    user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
+    ports:
+      - "${DBMCP_BIND_ADDRESS:-127.0.0.1}:${DBMCP_PORT:-8807}:8807"
+    volumes:
+      - ./runtime:/data
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    stop_grace_period: 20s
+```
 
-## 功能
+固定版本与 `latest` 均支持 **`linux/amd64` / `linux/arm64`**，Docker 自动选择架构。建议部署使用固定版本。也可直接下载本仓库的 [docker-compose.yml](docker-compose.yml) 与 [.env.example](.env.example)。
 
-| MCP 工具 | 说明 |
-|---|---|
-| `list_instances` | 列出实例清单（名称/类型/权限/启用状态/连接信息，不含密码） |
-| `db_ping` | 检测某实例连通性，返回版本与延迟 |
-| `postgres_query` | 只读查询（SELECT/WITH/SHOW/EXPLAIN/TABLE/VALUES），结果以 Markdown 表格返回 |
-| `postgres_execute` | 写操作（INSERT/UPDATE/DELETE/DDL），仅 `write` 实例；高危 DDL 需 `confirm=true` |
-| `postgres_list_schemas` / `postgres_list_tables` | 浏览 schema 与表/视图 |
-| `postgres_describe_table` / `postgres_list_indexes` | 查看表结构与索引 |
-| `redis_get` / `redis_mget` / `redis_type` / `redis_ttl` / `redis_exists` | Redis string 读取与元信息 |
-| `redis_scan` / `redis_keys` | key 遍历（推荐 SCAN，KEYS 仅适合小实例） |
-| `redis_hash_get` / `redis_list_range` / `redis_set_members` / `redis_zset_range` | hash / list / set / zset 读取 |
-| `redis_set` / `redis_del` / `redis_expire` / `redis_persist` | string 写入与过期管理 |
-| `redis_hash_set` / `redis_hash_del` | hash 写入 |
-| `redis_list_push` / `redis_list_pop` | list 写入 |
-| `redis_set_add` / `redis_set_remove` | set 写入 |
-| `redis_zset_add` / `redis_zset_remove` | zset 写入 |
-
-安全策略：**只读实例拦截写 + 高危 DDL 二次确认 + 全量审计**。每次工具调用写入 SQLite
-审计库，**记录 SQL / Redis 命令明文**（超长截断，默认保留 30 天），便于事后回溯
-「谁在什么时候执行了什么」；密码等凭据绝不入库。
-
-### 只读实例是怎么被拦住的
-
-不要只靠 `sql.upper().startswith("SELECT")` 判定只读——那会被这些绕过：
-`WITH x AS (DELETE ... RETURNING *) SELECT ...`（data-modifying CTE）、
-`SELECT 1; DROP TABLE t`（多语句）、`SELECT ... INTO new_table`、
-`SELECT ... FOR SHARE`、`SELECT pg_read_file('/etc/passwd')`。
-
-本服务做三层防护：
-
-1. **工具层**：`read` 实例收到写工具/写语句直接拒绝，给出可读提示
-2. **SQL 静态分析**（`sqlguard.py`）：先做词法扫描（正确剥离注释、字符串、
-   美元引号、引号标识符），把 SQL 归一成 token 再分类；拒绝多语句、写关键字、
-   危险函数、`SELECT INTO`、`FOR SHARE`。`EXPLAIN ANALYZE DELETE ...` 会按内层语句判定
-3. **数据库只读事务**（`db/pg.py`）：`read` 实例的查询一律跑在 `BEGIN READ ONLY` 里，
-   即便 1/2 漏判，PostgreSQL 自己会拒绝写入
-
-## 三种交付方式
-
-每种方式都启动完整 HTTP MCP 服务和管理页面。
-
-### 源码
-
-使用上面的 `uv sync --locked` 与 `uv run --locked db-mcp`。已有部署继续指定原配置文件路径，不能用空配置替换真实配置。
-
-### Docker / Compose
-
-公开镜像：[lijx559/db-mcp](https://hub.docker.com/r/lijx559/db-mcp)，固定版本 `2.1.0` 和 `latest` 均支持 `linux/amd64` / `linux/arm64`，拉取时自动选择架构。
-镜像内已包含管理页面，不要求运行环境安装 Node；Compose 使用 `lijx559/db-mcp:2.1.0`。
+### 3. 初始化并启动
 
 ```bash
-mkdir -p runtime
-export DOCKER_UID=$(id -u)
-export DOCKER_GID=$(id -g)
 docker compose pull
-# 仅首次部署初始化；已有配置升级时跳过此行
 docker compose run --rm db-mcp db-mcp --init --config /data/config.yaml
 docker compose up -d
-docker compose logs -f
+docker compose ps
+curl -fsS http://127.0.0.1:8807/healthz
 ```
 
-Compose 把 `runtime/` 整体挂载到 `/data`，默认仅宿主回环地址暴露 8807。
-必须挂目录，配置通过临时文件原子替换；人员/token、审计和配置要放在同一个持久化部署目录中。
-容器内监听 `0.0.0.0`，以非 root 用户运行，健康接口 `/healthz`。
-配置用到的 `${ENV_VAR}` 必须显式加入 Compose `environment`，缺变量启动即失败。
-`build: .` 保留为源码构建选项；本地修改后可用 `docker compose up -d --build`。生产部署优先使用固定版本，升级前备份 `runtime/`。
+`--init` 仅首次创建空配置，不覆盖已有文件；已有部署升级时跳过初始化命令。健康接口返回 `{"ok":true}` 后，打开 **http://127.0.0.1:8807/**。
 
-### Python 包 / uvx
+### 4. 创建首位用户
 
 ```bash
-uv build
-uvx --from ./dist/db_mcp-2.1.0-py3-none-any.whl db-mcp --init --config /absolute/path/db-mcp/config.yaml
-uvx --from ./dist/db_mcp-2.1.0-py3-none-any.whl db-mcp --config /absolute/path/db-mcp/config.yaml
+docker compose exec db-mcp cat /data/data/setup.key
 ```
 
-也可 `uv tool install` 安装 wheel。wheel/sdist 内含默认配置、管理页与字体，运行数据必须使用外部可写路径，不能写到包或 uvx 缓存目录。
-uvx 解析包依赖，不使用源码 `uv.lock`；生产完整复现优先源码锁文件或版本化镜像。当前不宣称新版本已发布 PyPI 或 GitHub Release。
+把一次性初始化码填入页面，设置用户名与独立密码。初始化完成后该文件自动删除，没有默认登录账号。
 
-## 配置与路径
+在「数据库实例」中添加 PostgreSQL 或 Redis，选择只读/读写并测试连接；再到「MCP Token」创建客户端专用 token。容器需要能直连目标数据库，数据库原有账号权限仍然生效。
 
-`config.example.yaml` 展示 PostgreSQL、Redis、read/write 与环境变量引用。新安装建议先 `--init` 得到无真实资源的配置。
+### Compose 配置说明
 
-| 数据 | 默认相对配置文件父目录的位置 |
-|---|---|
-| 人员、会话、token | `data/service.db` |
-| 双审计 SQLite | `audit/audit.db` |
-| 一次性初始化码 | `data/setup.key`（终端会提示） |
+| 配置 | 默认值 | 说明 |
+|---|---|---|
+| `COMPOSE_PROJECT_NAME` | `db-mcp` | 同机多套部署使用不同项目名、宿主端口与运行目录。 |
+| `DBMCP_IMAGE` | `lijx559/db-mcp:2.1.0` | 固定镜像版本，升级时显式修改。 |
+| `DBMCP_BIND_ADDRESS` | `127.0.0.1` | 默认仅本机可访问；需要局域网直连时改为 `0.0.0.0`。 |
+| `DBMCP_PORT` | `8807` | 宿主端口；容器内端口仍为 `8807`。 |
+| `DOCKER_UID` / `DOCKER_GID` | `1000` / `1000` | 必须对 `runtime/` 有读写权限。 |
+| `./runtime:/data` | 目录挂载 | 同时持久化配置、身份、token 与审计，不能改为仅挂载单个配置文件。 |
+| `env_file: .env` | `.env` | 将资源凭据注入容器；`.env` 同时参与 Compose 变量替换。 |
+| `TZ` | `Asia/Shanghai` | 容器时区；审计时间以 UTC 存储。 |
 
-配置中的相对持久化路径以配置目录为基准；CLI `--data-dir` 相对启动工作目录解析。SQLite、初始化码、配置与凭据均不入 Git 或镜像。
-密码只写不读；编辑或测试实例时密码留空保留已有值。保存 YAML 保留 `${ENV_VAR}` 原文但会丢失注释，`$$` 表示字面 `$`。
-`GET /api/config-raw` 导出脱敏副本，移除旧 token 并遮蔽数据库密码，不能直接当作完整秘密备份。
+配置样例见 [config.example.yaml](config.example.yaml)。实际配置为 `runtime/config.yaml`；配置中的相对路径以配置文件目录为基准。`${VARIABLE}` 从**容器环境**读取，缺少变量会报错；凭据可添加到 `.env`，不要把网页密码或 MCP token 写进该文件。网页保存配置保留环境变量引用，但会丢失 YAML 注释。
 
-网关子路径示例：
+容器中的 `127.0.0.1` 指向容器自身。目标服务运行在宿主机时，Docker Desktop 可使用 `host.docker.internal`；Linux 可按环境添加 `extra_hosts: ["host.docker.internal:host-gateway"]`。连接远端资源时填写容器可达的地址。
 
-```nginx
-location /项目-db-mcp/ {
-    proxy_pass http://127.0.0.1:8807/;
-    proxy_http_version 1.1;
-    proxy_buffering off;
-}
-```
-
-前端资源和 API 使用相对路径。HTTPS 设置 `auth.cookie_secure: true`，子路径建议 `auth.cookie_path: /项目-db-mcp/`。
-多个项目分别配置容器名、端口、部署目录和网关子路径，不能共享身份或审计目录。
+<a id="connect"></a>
 
 ## MCP 接入
 
-在后台 MCP Token 页创建凭证，配置客户端 HTTP 端点与认证头：
+在工作台创建并保存 MCP token，然后为支持 HTTP 的客户端添加配置：
 
 ```json
 {
@@ -147,30 +139,131 @@ location /项目-db-mcp/ {
 }
 ```
 
-已部署服务的用户只需接入 URL，无需自己另启一份服务。
+上例适用于客户端和服务在同一台机器。远程接入请把 URL 换成网关的实际 HTTPS 地址；已有网关的用户无需再启动一份服务。使用 token 后可先调用 `list_instances` 获取资源名称。
 
-## 双审计
+| 工具 | 用途 |
+|---|---|
+| `list_instances` / `db_ping` | 发现实例，检查版本、连通性与延迟。 |
+| `postgres_query` / `postgres_execute` | 只读查询与受控写入。 |
+| `postgres_list_schemas` / `postgres_list_tables` | 浏览 schema、表和视图。 |
+| `postgres_describe_table` / `postgres_list_indexes` | 查看字段、约束与索引。 |
+| `redis_get` / `redis_scan` / `redis_type` 等 | 读取 string/hash/list/set/zset、遍历 key 与查询元信息。 |
+| `redis_set` / `redis_del` / `redis_expire` 等 | 在 write 实例上写入、删除、修改集合与过期时间。 |
 
-人员操作审计记录登录与失败、退出、人员与 token 变更、实例增删改、连接测试、导出等；身份变更与审计 outbox 在同一 SQLite 事务提交，再幂等投递到审计库。
-YAML/外部副作用用同一操作 ID 记录开始与结果，不宣称跨数据库与配置文件的全局原子性。
+每个实例使用 `permissions: read` 或 `write`，默认 `read`。SQL 每次只允许一条语句；高危 `DROP`/`TRUNCATE`/`ALTER` 需要 `confirm=true`。查询默认最多返回 1000 行、50000 个结果字符；大数据集优先用 `redis_scan`。SQL 词法分析不能判断任意存储过程的内部行为，只读事务是数据库侧的兜底。网络错误后的重试不保证写操作仅执行一次。
 
-MCP 调用审计记录稳定 token 身份、工具、实际实例类型/主机/端口/数据库/连接账号快照、SQL 或 Redis 操作、行数、请求编号、可观测来源 IP 与结果。
-外部执行前记录 running，完成后记录成功/错误/超时/取消；重启发现残留执行标为 unknown。重连尝试另行关联，不能承诺外部写入只发生一次。
-旧 `audit_records` 保留迁移为 legacy，不伪造无法证实的人员/token 归属。
+## 人员、凭证与审计
 
-两类审计默认保留 30 天，支持分别筛选、分页、详情与 CSV 导出。密码/token/会话秘密不入审计，不保存完整查询结果。
-SQL 与 Redis 参数可能包含业务敏感值，已识别凭据脱敏与长度截断不能自动识别任意业务秘密。SQLite 是本地追溯存储，不保证防篡改。
+- 网页使用用户名/密码、HttpOnly Cookie 会话与 CSRF 校验；所有启用人员同权。
+- MCP token 与人员账号独立：新 token 只展示一次明文，后续只显示元数据；仅用于 `/mcp`，不能登录网页。
+- 重启、升级或重建容器保留有效 token；创建新 token、停用创建者不会自动吊销旧 token。密码修改或人员停用会撤销该人员会话。
+- 人员审计记录登录与配置变更；MCP 审计记录 token、实际实例类型/主机/端口/数据库/连接账号及 SQL 或 Redis 操作、结果和耗时。默认保留 30 天，可筛选、查看详情与导出 CSV。
+- 审计不保存凭据或完整查询结果。SQL 和 Redis 参数可能包含业务数据，已识别凭据脱敏不能识别任意业务秘密。SQLite 审计不提供防篡改或跨系统事务保证。
 
-## 从旧版本迁移
+<a id="operations"></a>
 
-1. 停止旧实例，备份原配置、环境变量及审计和身份数据库；存在 WAL 时先正常停止或使用 SQLite 备份。
-2. 在副本演练新版本启动。显式配置的旧 `auth.users` token 会幂等导入独立身份库，保留 MCP 使用；网页使用新的用户名和密码。
-3. 用本机初始化码创建首位网页登录人员，检查实例列表、read/write 防护、旧 token、新会话、双审计与子路径部署。
-4. 已吊销凭证不会因重启重新导入。不得删除唯一身份库或用 `--init` 覆盖配置来修复登录。
-5. 空配置不生成旧的 `admin/admin` token。若旧配置显式包含该 token，仍按用户保留旧 token 的要求迁移，部署人员可单独吊销。
-6. 发布时使用新的版本标签；回滚需恢复匹配的配置和数据备份，不能只回滚镜像后假定迁移兼容。
+## 运维与升级
 
-## 开发验证
+### 持久化位置
+
+| 宿主路径 | 内容 |
+|---|---|
+| `runtime/config.yaml` | 服务与资源配置。 |
+| `runtime/data/service.db` | 人员、会话与 token 验证值。 |
+| `runtime/audit/audit.db` | 人员操作与 MCP 调用审计。 |
+| `runtime/data/setup.key` | 仅首次初始化期间存在。 |
+
+这些文件与 `.env`、`backups/` 均不应提交到 Git；升级或更换容器时保留整个 `runtime/`。
+
+```bash
+docker compose logs -f --tail=100
+docker compose restart
+docker compose down
+```
+
+`down` 停止并移除容器，不删除宿主 `runtime/`。停止服务会中断在途调用。
+
+### 备份与更新
+
+先停止服务再备份完整目录，包含 SQLite 的 WAL/SHM 文件；也可使用可靠的 SQLite 在线备份方式。
+
+```bash
+mkdir -p backups
+docker compose stop
+(umask 077; tar -czf "backups/runtime-$(date +%Y%m%d-%H%M%S).tar.gz" runtime .env docker-compose.yml)
+docker compose start
+```
+
+修改 `.env` 中的 `DBMCP_IMAGE` 为已发布的新版本后执行：
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose ps
+```
+
+从旧版本升级时，显式配置的旧 `auth.users` token 会幂等迁移并继续用于 MCP。空配置不生成默认凭证；人员与 MCP token 分开管理。旧 `audit_records` 迁移为 legacy，不补造历史身份。先在备份副本演练迁移。回滚需要匹配的镜像、配置与数据备份，不要删除身份库或重建 token 来处理登录问题。
+
+### HTTPS 与反向代理
+
+默认端口只绑定本机，适合放在 HTTPS 反向代理后。子路径部署示例：
+
+```nginx
+location /db-mcp/ {
+    proxy_pass http://127.0.0.1:8807/;
+    proxy_http_version 1.1;
+    proxy_buffering off;
+    proxy_read_timeout 600s;
+}
+```
+
+在 `runtime/config.yaml` 中设置 `auth.cookie_secure: true`、`auth.cookie_path: /db-mcp/`，重启服务后使用 `https://mcp.example.com/db-mcp/` 与对应的 `.../db-mcp/mcp`。`proxy_pass` 尾斜杠会剥除前缀；页面资源和 API 使用相对路径。
+
+### 常见问题
+
+| 现象 | 处理 |
+|---|---|
+| 无法写配置或 SQLite | 检查 `.env` 中 UID/GID 与 `runtime/` 属主；保持整个目录可写。 |
+| 远程浏览器无法打开页面 | 默认仅本机监听；使用 HTTPS 反代、SSH 隧道，或显式修改绑定地址。 |
+| 网页登录后 MCP 仍认证失败 | 网页账号与 MCP token 分开管理，在 MCP Token 页面创建专用凭证。 |
+| 容器连不上资源 | 检查容器网络、目标地址与防火墙，避免误用容器自己的 `127.0.0.1`。 |
+| 提示初始化码文件不存在 | 首位用户创建后文件会删除，使用已有用户名/密码登录。 |
+
+## 其他启动方式
+
+三种方式都提供完整 HTTP MCP 服务与管理界面。
+
+<details>
+<summary>源码 + uv</summary>
+
+Python 3.10+ 与 uv；完整兼容性以锁文件与实际运行环境为准。
+
+```bash
+uv sync --locked
+uv run --locked db-mcp --init --config ./runtime/config.yaml
+uv run --locked db-mcp --config ./runtime/config.yaml
+```
+
+CLI 支持 `--host`、`--port`、`--config`、`--data-dir`。`--data-dir` 相对启动目录解析，只覆盖路径，不自动移动已有数据。
+
+</details>
+
+<details>
+<summary>Python 包 / uvx</summary>
+
+```bash
+uv build
+uvx --from ./dist/db_mcp-2.1.0-py3-none-any.whl db-mcp --init --config /absolute/path/db-mcp/config.yaml
+uvx --from ./dist/db_mcp-2.1.0-py3-none-any.whl db-mcp --config /absolute/path/db-mcp/config.yaml
+```
+
+wheel/sdist 包含默认配置和管理页面；也可 `uv tool install` 安装本地 wheel。当前只发布了 Docker 镜像，未宣称 PyPI 包或 GitHub Release 已发布。uvx 不读取源码的 `uv.lock`；生产完整复现优先使用固定镜像或源码锁文件。运行数据放在安装缓存以外的可写目录。
+
+</details>
+
+<a id="development"></a>
+
+## 开发与项目
 
 ```bash
 uv sync --locked
@@ -181,5 +274,12 @@ npm ci
 npm run build
 ```
 
-FastMCP 精确固定 `4.1.4`，升级在分支上更新声明与锁文件并回归，禁止启动时自动升级。
-管理界面使用 React 19、TypeScript、Tailwind v4、Base UI 和 TanStack Table，构建输出到 `src/db_mcp/web/static/` 并随服务交付。
+前端改动后必须重建静态产物。需要本地构建容器时，在仓库根目录执行：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+[开发约定](CLAUDE.md) · [发布摘要](docs/releases/2026-10-30-dockerhub.md) · [反馈问题](https://github.com/Lixiuxiu559/db-mcp/issues)
+
+本服务独立开发、发布和部署，与 [MCP 工作空间](https://github.com/Lixiuxiu559/mcp) 共享统一规范，运行时不依赖父目录或其他 MCP 仓库。

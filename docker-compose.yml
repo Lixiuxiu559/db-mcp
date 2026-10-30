@@ -1,13 +1,15 @@
+name: db-mcp
 services:
   db-mcp:
-    build: .
-    image: lijx559/db-mcp:2.1.0
+    image: ${DBMCP_IMAGE:-lijx559/db-mcp:2.1.0}
     restart: unless-stopped
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
     ports:
-      - "127.0.0.1:${DBMCP_PORT:-8807}:8807"
+      - "${DBMCP_BIND_ADDRESS:-127.0.0.1}:${DBMCP_PORT:-8807}:8807"
     volumes:
       - ./runtime:/data
+    env_file:
+      - .env
     environment:
-      TZ: Asia/Shanghai
-    # 配置引用的数据库密码环境变量需在此显式注入。
+      TZ: ${TZ:-Asia/Shanghai}
+    stop_grace_period: 20s
