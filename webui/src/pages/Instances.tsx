@@ -7,7 +7,6 @@ import {
   Trash2,
   Cable,
   Database,
-  ArrowUpRight,
 } from "lucide-react";
 import type { ColumnDef } from "@tanstack/react-table";
 import { api, json } from "../api";
@@ -18,6 +17,7 @@ import { Button } from "../components/ui/button";
 import { DataTable } from "../components/ui/data-table";
 import { Feedback, Status } from "../components/ui/feedback";
 import { Modal } from "../components/ui/dialog";
+import { InstanceDetails } from "../components/InstanceDetails";
 import { InstanceEditor } from "../components/InstanceEditor";
 
 export default function Instances() {
@@ -80,6 +80,7 @@ export default function Instances() {
         json("DELETE"),
       );
       setDeleting(null);
+      setDetails(null);
       reload();
       setMessage("实例配置已删除，历史审计保留。");
     } catch (error) {
@@ -96,7 +97,8 @@ export default function Instances() {
         cell: ({ row }) => (
           <button
             className="name-link"
-            onClick={() => setDetails(row.original)}
+            aria-label={`查看 ${row.original.name} 详情`}
+            onClick={() => { setDetails(row.original); setMessage(""); setActionError(""); }}
           >
             <span className="node-icon">
               <Database size={16} />
@@ -206,13 +208,16 @@ export default function Instances() {
     ],
     [checks, busy],
   );
+  const selected = details ? data.instances.find(instance => instance.name === details.name) || details : null;
   const enabled = data.instances.filter((instance) => instance.enabled).length;
   return (
     <>
+      <Feedback message={actionError} onDismiss={() => setActionError("")} />
+      <Feedback message={message} success onDismiss={() => setMessage("")} />
+      {selected ? <InstanceDetails instance={selected} check={checks[selected.name]} busy={!!busy} onBack={() => setDetails(null)} onTest={() => void test(selected)} onEdit={() => setEditor(selected)} onDelete={() => { setDeleting(selected); setActionError(""); }} /> : <>
       <div className="page-heading">
         <div>
-          <span className="eyebrow">DATABASE CONNECTIONS</span>
-          <h1>数据库实例</h1>
+          <h1 id="instances-heading" tabIndex={-1}>数据库实例</h1>
           <p>集中管理 PostgreSQL 与 Redis 连接，按实例约束工具读写范围。</p>
         </div>
         <Button variant="primary" onClick={() => setEditor(null)}>
@@ -247,8 +252,6 @@ export default function Instances() {
           </strong>
         </div>
       </div>
-      <Feedback message={actionError} onDismiss={() => setActionError("")} />
-      <Feedback message={message} success onDismiss={() => setMessage("")} />
       <section className="panel">
         <div className="panel-toolbar">
           <div className="search-input">
@@ -307,6 +310,7 @@ export default function Instances() {
           检测结果来自手动连接测试。连接密码仅由网关持有，不向 MCP 客户端返回。
         </div>
       </section>
+      </>}
       {editor !== undefined && (
         <InstanceEditor
           editing={editor}
@@ -350,100 +354,6 @@ export default function Instances() {
             {busy ? "正在删除…" : "删除配置"}
           </Button>
         </div>
-      </Modal>
-      <Modal
-        open={!!details}
-        onOpenChange={(open) => {
-          if (!open) setDetails(null);
-        }}
-        title={details?.name || "实例详情"}
-        description="当前配置与手动检测结果。路径表示配置，不代表存在活跃会话。"
-        wide
-      >
-        {details && (
-          <>
-            <div className="connection-path">
-              <div>
-                <span className="node-icon">
-                  <ArrowUpRight size={18} />
-                </span>
-                <strong>数据客户端</strong>
-                <small>MCP 调用方</small>
-              </div>
-              <span className="path-segment">
-                <span>MCP</span>
-              </span>
-              <div>
-                <span className="node-icon">
-                  <Cable size={18} />
-                </span>
-                <strong>db-mcp</strong>
-                <small>数据库网关</small>
-              </div>
-              <span className="path-segment">
-                <span>
-                  {details.type === "postgres" ? "PG" : "Redis"} :{details.port}
-                </span>
-              </span>
-              <div>
-                <span className="node-icon">
-                  <Database size={18} />
-                </span>
-                <strong>{details.name}</strong>
-                <small>{details.host}</small>
-              </div>
-            </div>
-            <dl className="detail-grid">
-              <dt>数据库类型</dt>
-              <dd>{details.type === "postgres" ? "PostgreSQL" : "Redis"}</dd>
-              <dt>目标端点</dt>
-              <dd className="mono wrap">
-                {details.host}:{details.port}
-              </dd>
-              <dt>数据库</dt>
-              <dd className="mono wrap">{details.database}</dd>
-              <dt>连接账号</dt>
-              <dd className="mono wrap">
-                {details.user || details.username || "默认账号"}
-              </dd>
-              {details.type === "postgres" && (
-                <>
-                  <dt>默认 Schema</dt>
-                  <dd className="mono wrap">{details.schema || "public"}</dd>
-                </>
-              )}
-              <dt>访问权限</dt>
-              <dd>
-                {details.permissions === "write"
-                  ? "读写 · write"
-                  : "只读 · read"}
-              </dd>
-              <dt>状态</dt>
-              <dd>
-                <Status value={details.enabled ? "enabled" : "disabled"} />
-              </dd>
-              <dt>连接密码</dt>
-              <dd>
-                {details.has_password ? "已配置，仅写入不回显" : "未配置"}
-              </dd>
-              <dt>最近手动检测</dt>
-              <dd className="wrap">
-                {checks[details.name]?.message || "尚未检测"}
-              </dd>
-            </dl>
-            <div className="dialog-actions right">
-              <Button
-                onClick={() => {
-                  setDetails(null);
-                  setEditor(details);
-                }}
-              >
-                <Pencil size={15} />
-                编辑配置
-              </Button>
-            </div>
-          </>
-        )}
       </Modal>
     </>
   );

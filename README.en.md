@@ -31,7 +31,7 @@ A self-hosted MCP gateway for PostgreSQL and Redis. Centralize connections and c
 | Read/write boundaries | Instances default to read-only; PostgreSQL combines tool permissions, SQL checks, and read-only transactions. |
 | Explicit confirmation | High-risk DDL requires `confirm=true`. |
 | Separate identity and audit | Independent web accounts and MCP tokens, actual database target snapshots, and 30-day audit retention. |
-| Unified workspace | Linkage UI, three theme modes, command palette, and responsive tables. |
+| Unified workspace | A fixed mint three-color palette, three theme modes, command palette, and responsive tables. |
 
 <a id="deploy"></a>
 
@@ -264,6 +264,8 @@ wheel/sdist includes default configuration and web assets. Local wheels can also
 <a id="development"></a>
 
 ## Development and project
+
+Use **Modern Professional** for all new or updated console pages. The service uses a fixed mint three-color palette with light/dark/system modes. The [development guide](CLAUDE.md) defines colors, system fonts, layout, controls, and migration status. Historical screenshots and released images do not define the current design specification.
 
 ```bash
 uv sync --locked

@@ -302,7 +302,6 @@ export default function Tokens() {
     <>
       <div className="page-heading">
         <div>
-          <span className="eyebrow">SERVICE CREDENTIALS</span>
           <h1>MCP Token</h1>
           <p>独立管理客户端凭证，每一次 MCP 调用按 token 留下操作痕迹。</p>
         </div>

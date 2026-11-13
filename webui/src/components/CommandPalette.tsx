@@ -3,6 +3,7 @@ import { Search, ArrowUp, ArrowDown, CornerDownLeft } from "lucide-react";
 import { Modal } from "./ui/dialog";
 import type { Page } from "../types";
 export const navigation: { id: Page; label: string; description: string }[] = [
+  { id: "overview", label: "总览", description: "实例、调用与最近事件" },
   { id: "instances", label: "数据库实例", description: "PostgreSQL / Redis 连接与读写权限" },
   { id: "tokens", label: "MCP Token", description: "独立服务凭证与客户端接入" },
   { id: "users", label: "用户管理", description: "登录账号与人员状态" },

@@ -230,9 +230,6 @@ export default function Audit({ kind }: { kind: AuditKind }) {
     <>
       <div className="page-heading">
         <div>
-          <span className="eyebrow">
-            {person ? "PEOPLE ACTIVITY" : "MCP ACTIVITY"}
-          </span>
           <h1>{person ? "人员操作审计" : "MCP 调用审计"}</h1>
           <p>
             {person
@@ -361,6 +358,7 @@ export default function Audit({ kind }: { kind: AuditKind }) {
           error={error}
           onRetry={reload}
           empty="当前条件下没有审计记录"
+          emptyHint="尝试调整时间范围或筛选条件。"
           emptyAction={
             hasFilters ? (
               <Button variant="secondary" onClick={clearFilters}>

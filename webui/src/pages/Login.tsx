@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { ArrowRight, Link2, LockKeyhole, Terminal } from "lucide-react";
+import { ArrowRight, Database, LockKeyhole } from "lucide-react";
 import { api, json, setCsrfToken } from "../api";
 import type { Session } from "../types";
 import { Button } from "../components/ui/button";
@@ -51,45 +51,17 @@ export default function Login({
     <div className="login-page">
       <header className="login-top">
         <a className="wordmark" href="./">
-          <Link2 size={21} />
-          <strong>链路</strong>
-          <span>DB MCP</span>
+          <Database size={20} aria-hidden="true" />
+          <strong>DB MCP Gateway</strong>
+          <span>Database Console</span>
         </a>
-        <ThemeControl />
+        <div className="login-preferences"><ThemeControl /></div>
       </header>
       <main className="login-layout">
-        <section className="login-context">
-          <span className="eyebrow">MCP CONNECTION WORKSPACE</span>
-          <h1>
-            让每次数据操作
-            <br />
-            都有清晰的来路。
-          </h1>
-          <p>
-            集中管理 PostgreSQL 与 Redis，分配服务凭证，追溯 SQL 和 Redis 操作。
-          </p>
-          <div className="login-path">
-            <span>
-              <Terminal size={18} />
-              数据客户端
-            </span>
-            <ArrowRight size={18} />
-            <span>
-              <Link2 size={18} />
-              DB MCP
-            </span>
-          </div>
-          <div className="login-note">
-            <LockKeyhole size={17} />
-            <span>人员使用账号密码登录。MCP token 在工作区内独立管理。</span>
-          </div>
-        </section>
         <section className="login-card">
           <div className="login-card-heading">
-            <span className="eyebrow">
-              {setup ? "FIRST-TIME SETUP" : "WELCOME BACK"}
-            </span>
-            <h2>{setup ? "建立第一个用户" : "登录工作区"}</h2>
+            <span className="login-emblem"><LockKeyhole size={20} aria-hidden="true" /></span>
+            <h1>{setup ? "建立第一个用户" : "登录工作区"}</h1>
             <p>
               {setup
                 ? "使用服务端初始化密钥创建账号，原有 MCP token 会继续保留。"
@@ -165,7 +137,7 @@ export default function Login({
         </section>
       </main>
       <footer className="login-footer">
-        DB MCP<span>链路工作台 · Linkage 1.0</span>
+        DB MCP<span>PostgreSQL / Redis · Database Console</span>
       </footer>
     </div>
   );

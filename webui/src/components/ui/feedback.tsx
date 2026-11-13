@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, X } from "lucide-react";
+import { AlertCircle, CheckCircle2, Circle, Clock3, LoaderCircle, X } from "lucide-react";
 
 export function Feedback({
   message,
@@ -60,9 +60,10 @@ export function Status({ value, label }: { value: string; label?: string }) {
         : ["pending", "unknown"].includes(value)
           ? "warning"
           : "offline";
+  const Icon = kind === "connected" ? CheckCircle2 : kind === "error" ? AlertCircle : kind === "calling" ? LoaderCircle : kind === "warning" ? Clock3 : Circle;
   return (
     <span className={`status status-${kind}`}>
-      <span className="status-shape" aria-hidden="true" />
+      <Icon size={12} aria-hidden="true" />
       {label || labels[value] || value}
     </span>
   );

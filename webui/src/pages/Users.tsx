@@ -190,7 +190,6 @@ export default function UsersPage({ currentUser }: { currentUser: User }) {
     <>
       <div className="page-heading">
         <div>
-          <span className="eyebrow">PEOPLE</span>
           <h1>用户管理</h1>
           <p>管理后台登录账号。人员权限一致，MCP token 单独管理。</p>
         </div>

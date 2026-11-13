@@ -68,6 +68,7 @@ export interface AuditRecord {
 }
 export type AuditKind = "mcp" | "person";
 export type Page =
+  | "overview"
   | "instances"
   | "users"
   | "tokens"

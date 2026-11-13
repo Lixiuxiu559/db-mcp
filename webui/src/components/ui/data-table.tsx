@@ -13,6 +13,7 @@ import {
   ArrowUp,
   ArrowUpDown,
   LoaderCircle,
+  Inbox,
   SearchX,
 } from "lucide-react";
 import { Button } from "./button";
@@ -22,6 +23,7 @@ export function DataTable<T>({
   columns,
   loading,
   empty = "暂无记录",
+  emptyHint = "添加记录或调整筛选条件后重试",
   sortable = true,
   stickyFirst = true,
   error,
@@ -32,6 +34,7 @@ export function DataTable<T>({
   columns: ColumnDef<T, unknown>[];
   loading?: boolean;
   empty?: string;
+  emptyHint?: string;
   sortable?: boolean;
   stickyFirst?: boolean;
   error?: string;
@@ -138,12 +141,14 @@ export function DataTable<T>({
             <div className="table-empty" role="status" aria-live="polite">
               {loading ? (
                 <LoaderCircle className="spin" size={24} aria-hidden="true" />
-              ) : (
+              ) : empty.includes("匹配") ? (
                 <SearchX size={24} aria-hidden="true" />
+              ) : (
+                <Inbox size={24} aria-hidden="true" />
               )}
               <strong>{loading ? "正在读取…" : empty}</strong>
               <span>
-                {loading ? "正在加载数据" : "添加记录或调整筛选条件后重试"}
+                {loading ? "正在加载数据" : emptyHint}
               </span>
               {!loading && emptyAction}
             </div>
