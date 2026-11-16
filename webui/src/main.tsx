@@ -1,13 +1,14 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
-import { ThemeProvider } from "./components/theme-provider";
-import "./app.css";
-import "./palette-controls.css";
+import "antd/dist/reset.css";
+import "./global.css";
 import App from "./App";
+import { ConsoleProvider } from "./components/ConsoleProvider";
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <ThemeProvider>
+    <ConsoleProvider themeKey="db-mcp-theme" cssVarKey="db-mcp">
       <App />
-    </ThemeProvider>
+    </ConsoleProvider>
   </StrictMode>,
 );

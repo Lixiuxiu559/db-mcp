@@ -254,6 +254,102 @@ async def test_users_and_tokens_managed_separately(app, gw):
     assert gw.state.identity.verify_token(secret)
     await request(app, "DELETE", f"/api/tokens/{token_id}", token="tok-bob")
     assert gw.state.identity.verify_token(secret) is None
+    listing = await request(app, "GET", "/api/tokens", token="tok-bob")
+    assert token_id not in {row["id"] for row in listing.json()["tokens"]}
+    update = await request(app, "PATCH", f"/api/tokens/{token_id}", token="tok-alice", json={"enabled": True})
+    assert update.status_code == 400 and "已删除" in update.json()["detail"]
+
+
+async def test_delete_member_requires_csrf_revokes_sessions_and_preserves_tokens(app, gw):
+    users = {user["username"]: user for user in gw.state.identity.list_users()}
+    alice_id, bob_id = users["alice"]["id"], users["bob"]["id"]
+    _, bob_session, _ = gw.state.identity.login("bob", "password-bob")
+    secret, token = gw.state.identity.create_token("bob-client", bob_id)
+    await gw.state.audit.log_person({
+        "action": "user.login", "actor_user_id": bob_id, "username": "bob", "status": "ok"
+    })
+    path = f"/api/users/{bob_id}"
+
+    assert (await request(app, "DELETE", path)).status_code == 401
+    assert (await request(app, "DELETE", path, token=secret)).status_code == 401
+    denied = await request(app, "DELETE", path, token="tok-alice", headers={"X-CSRF-Token": "wrong"})
+    assert denied.status_code == 403
+    assert gw.state.identity.session(bob_session) is not None
+    deleted = await request(app, "DELETE", path, token="tok-alice")
+    assert deleted.status_code == 200 and deleted.json() == {"ok": True}
+    assert gw.state.identity.session(bob_session) is None
+    assert gw.state.identity.verify_token(secret)["id"] == token["id"]
+    assert gw.state.identity.token_info(token["id"])["created_by"] == bob_id
+    listed = await request(app, "GET", "/api/users", token="tok-alice")
+    assert [user["id"] for user in listed.json()["users"]] == [alice_id]
+    assert (await request(app, "DELETE", f"/api/users/{alice_id}", token="tok-alice")).status_code == 400
+    assert (await request(app, "DELETE", path, token="tok-alice")).status_code == 400
+
+    history = await request(app, "GET", "/api/audit?kind=person", token="tok-alice")
+    deleted = [row for row in history.json()["records"] if row["action"] == "user.delete" and row["status"] == "ok"]
+    assert len(deleted) == 1
+    assert deleted[0]["actor_user_id"] == alice_id and deleted[0]["object_id"] == bob_id
+    assert deleted[0]["username"] == "alice" and "bob" in deleted[0]["summary"]
+    assert any(row["action"] == "user.login" and row["actor_user_id"] == bob_id for row in history.json()["records"])
+    assert secret not in history.text and "password-bob" not in history.text
+    assert gw.state.identity.pending_events() == []
+
+
+async def test_member_can_delete_own_account_with_another_enabled_account(app, gw):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as client:
+        login = await client.post("/api/auth/login", json={"username": "bob", "password": "password-bob"})
+        user_id = login.json()["user"]["id"]
+        deleted = await client.delete(f"/api/users/{user_id}", headers={"X-CSRF-Token": login.json()["csrf_token"]})
+        assert deleted.status_code == 200 and deleted.json() == {"ok": True}
+        assert (await client.get("/api/me")).status_code == 401
+        assert (await client.get("/api/auth/status")).json() == {"setup_required": False}
+    assert [user["username"] for user in gw.state.identity.list_users()] == ["alice"]
+
+
+async def test_last_enabled_member_cannot_be_deleted_when_disabled_member_exists(app, gw):
+    users = {user["username"]: user for user in gw.state.identity.list_users()}
+    bob_id = users["bob"]["id"]
+    disabled = await request(app, "PATCH", f"/api/users/{bob_id}", token="tok-alice", json={"enabled": False})
+    assert disabled.status_code == 200
+    denied = await request(app, "DELETE", f"/api/users/{users['alice']['id']}", token="tok-alice")
+    assert denied.status_code == 400 and "最后一个" in denied.json()["detail"]
+    assert (await request(app, "DELETE", f"/api/users/{bob_id}", token="tok-alice")).status_code == 200
+
+
+async def test_token_delete_is_final_idempotent_and_preserves_audit_history(app, gw):
+    created = await request(app, "POST", "/api/tokens", token="tok-alice", json={"name": "delete-me"})
+    secret, item = created.json()["token"], created.json()["item"]
+    await gw.state.audit.log({
+        "token_id": item["id"], "token_name": item["name"], "tool": "postgres_query",
+        "statement": "SELECT 42", "instance": "pg-read", "status": "ok",
+    })
+    path = f"/api/tokens/{item['id']}"
+    assert (await request(app, "DELETE", path)).status_code == 401
+    assert (await request(app, "DELETE", path, token=secret)).status_code == 401
+    denied = await request(app, "DELETE", path, token="tok-alice", headers={"X-CSRF-Token": "wrong"})
+    assert denied.status_code == 403
+    assert gw.state.identity.verify_token(secret) is not None
+    assert (await request(app, "DELETE", path, token="tok-alice")).json() == {"ok": True}
+    assert (await request(app, "DELETE", path, token="tok-alice")).status_code == 200
+    assert gw.state.identity.verify_token(secret) is None
+    history = await request(app, "GET", f"/api/audit?kind=mcp&token_id={item['id']}&q=SELECT", token="tok-alice")
+    assert history.json()["total"] == 1
+    assert history.json()["records"][0]["token_name"] == "delete-me"
+    people = await request(app, "GET", "/api/audit?kind=person&q=token.delete", token="tok-alice")
+    deleted = [row for row in people.json()["records"] if row["status"] == "ok"]
+    assert len(deleted) == 2
+    assert all(row["object_id"] == item["id"] and row["username"] == "alice" for row in deleted)
+    assert all(row["summary"] == "删除 MCP Token" for row in deleted)
+    assert secret not in history.text and secret not in people.text
+    assert gw.state.identity.pending_events() == []
+
+
+async def test_management_token_list_hides_previously_revoked_tokens(app, gw):
+    item = gw.state.identity.verify_token("tok-bob")
+    gw.state.identity.revoke_token(item["id"])
+    listed = (await request(app, "GET", "/api/tokens", token="tok-alice")).json()["tokens"]
+    assert listed and all(not row["revoked"] for row in listed)
+    assert item["id"] not in {row["id"] for row in listed}
 
 
 async def test_session_revoked_when_password_changes(app):

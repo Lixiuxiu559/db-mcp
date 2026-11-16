@@ -352,9 +352,20 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
         request.state.outbox_recorded = True
         return JSONResponse(item)
 
+    @route("/api/users/{id}", ["DELETE"], action="user.delete", object_type="user")
+    async def delete_user(request):
+        await asyncio.to_thread(
+            state.identity.delete_user,
+            request.path_params["id"],
+            request.state.identity_event,
+        )
+        request.state.outbox_recorded = True
+        return JSONResponse({"ok": True})
+
     @route("/api/tokens", ["GET"])
     async def list_tokens(request):
-        return JSONResponse({"tokens": await asyncio.to_thread(state.identity.list_tokens)})
+        tokens = await asyncio.to_thread(state.identity.list_tokens, include_deleted=False)
+        return JSONResponse({"tokens": tokens})
 
     @route("/api/tokens", ["POST"], action="token.create", object_type="token")
     async def create_token(request):
@@ -383,10 +394,11 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
         request.state.outbox_recorded = True
         return JSONResponse(item)
 
-    @route("/api/tokens/{id}", ["DELETE"], action="token.revoke", object_type="token")
-    async def revoke_token(request):
+    @route("/api/tokens/{id}", ["DELETE"], action="token.delete", object_type="token")
+    async def delete_token(request):
+        request.state.identity_event["summary"] = "删除 MCP Token"
         await asyncio.to_thread(
-            state.identity.revoke_token, request.path_params["id"], request.state.identity_event
+            state.identity.delete_token, request.path_params["id"], request.state.identity_event
         )
         request.state.outbox_recorded = True
         return JSONResponse({"ok": True})

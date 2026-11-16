@@ -1,15 +1,5 @@
-export interface User {
-  id: string;
-  username: string;
-  display_name: string;
-  enabled: boolean;
-  created_at?: string;
-  last_login_at?: string | null;
-}
-export interface Session {
-  user: User;
-  csrf_token: string;
-}
+export type { User, Session, TokenEntry } from "./console-types";
+
 export interface InstanceEntry {
   name: string;
   type: "postgres" | "redis";
@@ -22,17 +12,6 @@ export interface InstanceEntry {
   permissions: "read" | "write";
   enabled: boolean;
   has_password: boolean;
-}
-export interface TokenEntry {
-  id: string;
-  name: string;
-  description: string;
-  prefix: string;
-  enabled: boolean;
-  revoked: boolean;
-  created_by: string | null;
-  created_at: string;
-  last_used_at: string | null;
 }
 export interface AuditRecord {
   id: string | number;

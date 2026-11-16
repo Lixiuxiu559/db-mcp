@@ -31,7 +31,7 @@ A self-hosted MCP gateway for PostgreSQL and Redis. Centralize connections and c
 | Read/write boundaries | Instances default to read-only; PostgreSQL combines tool permissions, SQL checks, and read-only transactions. |
 | Explicit confirmation | High-risk DDL requires `confirm=true`. |
 | Separate identity and audit | Independent web accounts and MCP tokens, actual database target snapshots, and 30-day audit retention. |
-| Unified workspace | A fixed mint three-color palette, three theme modes, command palette, and responsive tables. |
+| Unified workspace | Ant Design 6, OPPO Sans, light/dark themes, a collapsible sidebar, and shared table pagination. |
 
 <a id="deploy"></a>
 
@@ -156,7 +156,8 @@ Each instance uses `permissions: read` or `write`, defaulting to `read`. Only on
 
 - Web access uses username/password, HttpOnly session cookies, and CSRF protection. All enabled users have equal management access.
 - MCP tokens are separate from users. A new token is shown in plaintext only once; subsequent views expose metadata only. Tokens authorize `/mcp`, not web login.
-- Restarts, upgrades, and container replacement preserve valid tokens. Creating a token or disabling its creator does not revoke other tokens. Password changes and user disabling revoke that user's web sessions.
+- Restarts, upgrades, and container replacement preserve valid tokens. Creating a token, disabling its creator, or deleting its creator does not revoke other tokens. Password changes, disabling, and deletion revoke that user's web sessions. Member switches save immediately; deletion requires confirmation and at least one enabled member must remain. With another enabled member present, you can disable or delete your own account and will be signed out.
+- Token switches directly enable or disable access. Confirmed deletion permanently invalidates the credential and removes it from the management list while retaining its tombstone and audit history.
 - Management audit records logins and configuration changes. MCP audit records token identity, actual instance type/host/port/database/account and SQL or Redis operation, outcome, and duration. Retention defaults to 30 days, with filters, details, and CSV export.
 - Audit excludes credentials and complete query results. SQL and Redis arguments may contain business data; redaction of recognized credentials cannot detect every business secret. Local SQLite audit is neither tamper-proof nor a cross-system transaction guarantee.
 
@@ -265,7 +266,7 @@ wheel/sdist includes default configuration and web assets. Local wheels can also
 
 ## Development and project
 
-Use **Modern Professional** for all new or updated console pages. The service uses a fixed mint three-color palette with light/dark/system modes. The [development guide](CLAUDE.md) defines colors, system fonts, layout, controls, and migration status. Historical screenshots and released images do not define the current design specification.
+The console uses **Ant Design 6**, OPPO Sans 4.0, native light/dark themes, a 56px header, and a 220px/64px collapsible sidebar. Top-level pages show content without repeating menu titles. All table headers and cells are centered, do not stick by default, and share 10/20/50 pagination with a default of 10. The theme defaults to light and is switched only in the header. Components, original font and license, dependencies, and static assets are held within this service. See the [development guide](CLAUDE.md) for layout, interaction, and validation rules. Local source and build migration does not update published images.
 
 ```bash
 uv sync --locked

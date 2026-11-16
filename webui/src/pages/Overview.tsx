@@ -1,40 +1,24 @@
-import { useState } from "react";
-import {
-  Activity,
-  ArrowRight,
-  CircleCheck,
-  CircleAlert,
-  Network,
-  Database,
-} from "lucide-react";
+import { useEffect, useState } from "react";
+import { Activity, ArrowRight, CircleAlert, Network, Database } from "lucide-react";
+import { Button, Col, Row } from "antd";
 import type { AuditRecord, Page, InstanceEntry, TokenEntry } from "../types";
 import { useResource } from "../lib/use-resource";
-import { formatTime } from "../lib/utils";
-import { Button } from "../components/ui/button";
-import { Feedback, Status } from "../components/ui/feedback";
+import { useListPagination } from "../lib/pagination";
+import { personActionLabel } from "../lib/audit-labels";
+import { Feedback } from "../components/Feedback";
+import { PageHeading } from "../components/PageHeading";
+import { OverviewMetrics } from "../components/OverviewMetrics";
+import type { OverviewMetric } from "../components/OverviewMetrics";
+import { RecentMcpCalls } from "../components/RecentMcpCalls";
+import type { RecentMcpCall } from "../components/RecentMcpCalls";
+import { RecentActivity } from "../components/RecentActivity";
+import type { RecentActivityItem } from "../components/RecentActivity";
 
 interface AuditResult {
   records: AuditRecord[];
   total: number;
 }
-const actions: Record<string, string> = {
-  "user.login": "登录后台",
-  "user.initialize": "初始化工作区",
-  "user.logout": "退出登录",
-  "instance.create": "添加数据库实例",
-  "instance.update": "更新数据库实例",
-  "instance.delete": "删除数据库实例",
-  "instance.test": "测试连接",
-  "token.create": "创建 Token",
-  "token.update": "更新 Token",
-  "token.revoke": "吊销 Token",
-  "user.create": "添加成员",
-  "user.update": "更新成员",
-  "audit.export": "导出审计",
-};
 const startOfWindow = () => new Date(Date.now() - 86400000).toISOString();
-const shortTime = (value: string) =>
-  new Date(value).toLocaleTimeString("zh-CN", { hour12: false });
 
 export default function Overview({
   onNavigate,
@@ -46,6 +30,7 @@ export default function Overview({
   onRefreshHealth: () => void;
 }) {
   const [since, setSince] = useState(startOfWindow);
+  const { pagination, resetPage } = useListPagination();
   const instances = useResource<{ instances: InstanceEntry[] }>("/api/instances", {
     instances: [],
   });
@@ -54,9 +39,18 @@ export default function Overview({
   });
   const windowQuery = `since=${encodeURIComponent(since)}`;
   const calls = useResource<AuditResult>(
-    `/api/audit?kind=mcp&limit=3&${windowQuery}`,
+    `/api/audit?kind=mcp&limit=${pagination.pageSize}&offset=${(pagination.current - 1) * pagination.pageSize}&${windowQuery}`,
     { records: [], total: 0 },
   );
+  useEffect(() => {
+    if (
+      !calls.loading &&
+      !calls.error &&
+      pagination.current > Math.max(1, Math.ceil(calls.data.total / pagination.pageSize))
+    ) {
+      resetPage();
+    }
+  }, [calls.loading, calls.error, calls.data.total, pagination.current, pagination.pageSize, resetPage]);
   const failures = useResource<AuditResult>(
     `/api/audit?kind=mcp&status=error&limit=1&${windowQuery}`,
     { records: [], total: 0 },
@@ -67,177 +61,103 @@ export default function Overview({
   });
   const resources = [instances, tokens, calls, failures, events];
   const loading = resources.some((resource) => resource.loading);
-  const error = [
-    ...new Set(resources.map((resource) => resource.error).filter(Boolean)),
+  const metricError = [
+    ...new Set([instances, tokens, failures].map((resource) => resource.error).filter(Boolean)),
   ].join("；");
-  const enabledTokens = tokens.data.tokens.filter(
-    (token) => token.enabled && !token.revoked,
-  ).length;
+  const enabledTokens = tokens.data.tokens.filter((token) => token.enabled && !token.revoked).length;
   const number = (
     value: number,
     resource: { loading: boolean; error: string },
-  ) =>
-    resource.error || resource.loading ? "—" : value.toLocaleString("zh-CN");
+  ) => (resource.error || resource.loading ? "—" : value);
   function refresh() {
+    resetPage();
     onRefreshHealth();
     setSince(startOfWindow());
     instances.reload();
     tokens.reload();
     events.reload();
-    calls.reload();
-    failures.reload();
   }
+  const metrics: OverviewMetric[] = [
+    {
+      label: "数据库实例总数",
+      icon: <Database size={15} aria-hidden="true" />,
+      value: number(instances.data.instances.length, instances),
+    },
+    {
+      label: "近 24h MCP 调用",
+      icon: <Activity size={15} aria-hidden="true" />,
+      value: number(calls.data.total, calls),
+    },
+    {
+      label: "近 24h 执行失败",
+      icon: <CircleAlert size={15} aria-hidden="true" />,
+      value: number(failures.data.total, failures),
+      hint:
+        !failures.error && !calls.error && !loading && calls.data.total
+          ? `执行失败占比 ${((failures.data.total / calls.data.total) * 100).toFixed(2)}%`
+          : undefined,
+      danger: !failures.loading && !failures.error && failures.data.total > 0,
+    },
+    {
+      label: "有效 MCP Token",
+      icon: <Network size={15} aria-hidden="true" />,
+      value: number(enabledTokens, tokens),
+    },
+  ];
+  const callItems: RecentMcpCall[] = calls.data.records.map((record) => ({
+    id: record.id,
+    token: record.token_name || record.token_id || record.user || "历史调用",
+    target: record.instance || "网关",
+    tool: record.tool || "—",
+    status: record.status,
+  }));
+  const eventItems: RecentActivityItem[] = events.data.records.map((record) => ({
+    id: record.id,
+    title: `${personActionLabel(record.action)} · ${
+      record.object_id && ["instance", "config"].includes(record.object_type || "")
+        ? record.object_id
+        : record.username || record.user || "未认证来源"
+    }`,
+    timestamp: record.ts,
+    status: record.status,
+  }));
   return (
     <>
-      <div className="page-heading">
-        <div>
-          <h1>总览</h1>
-          <p>查看数据库实例与 MCP 工具调用</p>
-        </div>
-        <button
-          className={`status ${healthy ? "status-connected" : "status-offline"}`}
-          onClick={refresh}
-          disabled={loading}
-          aria-label="刷新总览数据"
-          title="刷新总览数据"
-        >
-          <CircleCheck size={12} />
-          {healthy ? "网关正常" : "状态未知"}
-        </button>
-      </div>
-      <Feedback message={error} />
-      <div className="overview-metrics" aria-busy={loading}>
-        <div className="metric-card">
-          <div className="metric-label">
-            数据库实例总数
-            <Database size={14} />
-          </div>
-          <strong>{number(instances.data.instances.length, instances)}</strong>
-          <p>PostgreSQL / Redis 实例</p>
-        </div>
-        <div className="metric-card">
-          <div className="metric-label">
-            近 24h MCP 调用
-            <Activity size={14} />
-          </div>
-          <strong>{number(calls.data.total, calls)}</strong>
-          <p>最近 24 小时的调用记录</p>
-        </div>
-        <div className="metric-card">
-          <div className="metric-label">
-            近 24h 执行失败
-            <CircleAlert size={14} />
-          </div>
-          <strong>{number(failures.data.total, failures)}</strong>
-          <p className="danger-text">
-            {!failures.error && !calls.error && !loading && calls.data.total
-              ? `执行失败占比 ${((failures.data.total / calls.data.total) * 100).toFixed(2)}%`
-              : "调用结果为失败的记录"}
-          </p>
-        </div>
-        <div className="metric-card">
-          <div className="metric-label">
-            有效 MCP Token
-            <Network size={14} />
-          </div>
-          <strong>{number(enabledTokens, tokens)}</strong>
-          <p>已启用且未吊销的凭证</p>
-        </div>
-      </div>
-      <section className="panel overview-calls">
-        <div className="section-heading">
-          <h2>最近 MCP 调用</h2>
-          <span className="tag">最近 24h</span>
-        </div>
-        <div className="table-scroll" aria-busy={calls.loading}>
-          <table className="data-table recent-calls">
-            <thead>
-              <tr>
-                <th scope="col">Token</th>
-                <th scope="col">目标数据库实例</th>
-                <th scope="col">工具</th>
-                <th scope="col">状态</th>
-              </tr>
-            </thead>
-            <tbody>
-              {calls.data.records.map((record) => (
-                <tr key={record.id}>
-                  <td>
-                    {record.token_name ||
-                      record.token_id ||
-                      record.user ||
-                      "历史调用"}
-                  </td>
-                  <td>{record.instance || "网关"}</td>
-                  <td>{record.tool || "—"}</td>
-                  <td>
-                    <Status value={record.status} />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {!calls.data.records.length && (
-            <p className="empty-inline">
-              {calls.error
-                ? "加载失败，请刷新重试"
-                : calls.loading
-                  ? "正在读取…"
-                  : "最近 24 小时暂无调用记录"}
-            </p>
-          )}
-        </div>
-      </section>
-      <section className="panel overview-events">
-        <div className="section-heading">
-          <h2>最近事件</h2>
-          <Button variant="quiet" onClick={() => onNavigate("person-audit")}>
-            查看审计
-            <ArrowRight size={14} />
-          </Button>
-        </div>
-        <div className="event-list" aria-busy={events.loading}>
-          {events.data.records.map((record, index) => (
-            <div
-              className="event-item"
-              key={record.id || `${record.ts}-${index}`}
-            >
-              {record.status === "ok" ? (
-                <CircleCheck size={14} className="success-text" />
-              ) : (
-                <CircleAlert size={14} className="danger-text" />
-              )}
-              <div>
-                <p title={record.object_id || undefined}>
-                  {actions[record.action || ""] ||
-                    record.action ||
-                    "工作区操作"}
-                  {record.object_id &&
-                  !["user", "session"].includes(record.object_type || "")
-                    ? ` · ${record.object_id}`
-                    : ` · ${record.username || record.user || "未认证来源"}`}
-                </p>
-                <time dateTime={record.ts} title={formatTime(record.ts)}>
-                  {shortTime(record.ts)}
-                </time>
-              </div>
-              <Status value={record.status} />
-            </div>
-          ))}
-        </div>
-        {!events.data.records.length && (
-          <p className="empty-inline">
-            {events.error
-              ? "加载失败，请刷新重试"
-              : events.loading
-                ? "正在读取…"
-                : "暂无人员操作记录"}
-          </p>
-        )}
-      </section>
-      <Button className="overview-more" onClick={() => onNavigate("instances")}>
+      <PageHeading title="总览" />
+      <Feedback message={metricError} />
+      <OverviewMetrics items={metrics} />
+      <Row gutter={16} style={{ marginBottom: 16 }}>
+        <Col span={14}>
+          <RecentMcpCalls
+            records={callItems}
+            total={calls.data.total}
+            targetLabel="目标数据库实例"
+            healthy={healthy}
+            loading={calls.loading}
+            error={calls.error}
+            refreshing={loading}
+            pagination={pagination}
+            onRefresh={refresh}
+            onViewAudit={() => onNavigate("mcp-audit")}
+          />
+        </Col>
+        <Col span={10}>
+          <RecentActivity
+            items={eventItems}
+            loading={events.loading}
+            error={events.error}
+            onRetry={events.reload}
+            onViewAudit={() => onNavigate("person-audit")}
+          />
+        </Col>
+      </Row>
+      <Button
+        type="link"
+        icon={<ArrowRight size={14} aria-hidden="true" />}
+        iconPlacement="end"
+        onClick={() => onNavigate("instances")}
+      >
         查看数据库实例列表
-        <ArrowRight size={14} />
       </Button>
     </>
   );

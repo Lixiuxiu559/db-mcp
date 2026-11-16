@@ -1,6 +1,6 @@
 # db-mcp 开发指引
 
-独立 PostgreSQL / Redis MCP 服务仓库。遵循工作空间最新统一架构和 Modern Professional（专业极简控制台）规范，运行、测试、打包不能依赖父目录或兄弟服务。
+独立 PostgreSQL / Redis MCP 服务仓库。遵循工作空间最新统一架构和 Ant Design 6 控制台规范，运行、测试、打包不能依赖父目录或兄弟服务。
 当前版本 2.1.0，Python FastMCP 精确 4.1.4。
 
 ## Git 分支
@@ -17,7 +17,7 @@
 - `audit.py`：独立人员/MCP/尝试审计、开始与终态、实际目标快照、旧表迁移。
 - `sqlguard.py` / `db/pg.py` / `db/pool.py`：SQL 分类、数据库只读事务、流式查询、连接池与重试。
 - `tools/`：inventory、postgres、redis。`web/api.py`：Cookie + CSRF 管理 API，不复用 MCP token。
-- `webui/`：React19 TS Vite Tailwind4 BaseUI shadcn源码 TanStack Lucide；构建产物 `src/db_mcp/web/static/`。
+- `webui/`：React 19 + TypeScript + Vite + Ant Design 6 + Lucide；构建产物 `src/db_mcp/web/static/`。
 
 MCP 请求路径：认证 → 审计开始 → 工具权限 → SQL 静态分析 → 只读事务/连接池 → 审计终态。
 配置写入后刷新内存并失效相关连接池；SQL防护、参数限制、危险操作确认不因网页同权而改变。
@@ -105,9 +105,13 @@ MCP 请求路径：认证 → 审计开始 → 工具权限 → SQL 静态分析
 ## 新增功能要求
 
 新增工具必须通过统一 FastMCP 注册路径和审计中间件，保留可读领域错误与实际目标追溯。
-新增或调整页面统一遵循 Modern Professional：系统字体、152px 侧栏、跨顶部品牌栏、18px 页面标题、12px 面板圆角与胶囊按钮/输入框/状态标签。采用已确认的八套马卡龙三色方案，DB 固定 A「薄荷奶绿」；配色仅开发时分配，服务 UI 不提供选择。每套含底色/主色/文字色，浅深模式只复用这三色，不添加红绿状态色、透明度混色或阴影。状态保留文字和图标。标准按钮高28px、输入框高32px、目标表格行高44px。
-服务内独立持有 tokens.css 和组件源码，禁止 Ant Design、玻璃布局和旧版石墨导航/蓝色主操作混用。DB 本地前端已迁移到该风格，包含总览、实例列表/独立详情、登录、账号偏好、人员/Token和双审计；本地构建不代表已发布镜像更新。
-三态主题 `light/dark/auto`，保留存储键 `linkage-theme` 兼容既有偏好，实际主题写 `data-theme`；配色由服务内 `SERVICE_PALETTE` 固定分配，有效方案 ID 写 `data-palette`，不读取浏览器配色偏好；相对 API/资源路径、键盘操作、390px 窄屏必须验证。
+新增或调整页面统一使用 Ant Design 6 原生组件、ConfigProvider 与浅深主题算法，主题参数集中在 `webui/src/theme.ts`，布局集中在 `global.css`，页面读取 `--ant-*` 语义变量。字体采用服务内 OPPO Sans 4.0 原始 TTF，保留许可；命令、配置与秘密值使用系统等宽字体。
+应用壳、主题 Provider、会话/导航、登录账号、总览、成员/Token 功能页和审计工具栏来自 MCP 工作空间的 `design-system/react/` 权威源，服务内持有独立副本。工作空间开发时先改公共源，再运行 `node design-system/scripts/sync-ui.mjs --write` 和 `--check`；本服务只适配品牌、导航、实例字段与数据库领域交互。独立克隆本服务可直接构建，不需要父目录。
+跨顶部品牌栏高 56px，侧栏展开 220px、折叠 64px，工作区上下 16px、左右 20px。一级菜单不重复显示菜单名称，`PageHeading` 仅保留屏幕阅读器 h1，操作放入内容面板工具栏；详情页保留资源名与返回。
+所有表格统一经过 `AppTable`（`DataTable` 也复用它），表头、正文与多行容器居中，默认不吸顶。分页仅 10/20/50、默认 10，改变大小回第一页；服务端分页使用 `useListPagination`，筛选变化回第一页、删除后处理越界。
+成员列表不显示头像，Switch 直接启停，删除须确认；最后一个启用成员前后端保护，其他启用成员存在时可自禁用/自删并退出。禁用、删除撤销网页会话，删除成员保留独立 MCP Token 与历史审计；身份变更和 outbox 同事务。Token 列表开关直接保存，删除后永久失效并隐藏，保留 tombstone 与审计；明文仅新建展示一次。
+主题仅 `light/dark`，默认浅色，顶栏为唯一切换入口；服务专属存储键为 `db-mcp-theme`，兼容旧 `mantine-color-scheme-value` / `linkage-theme` 并归一为浅深，不清会话或凭据。不提供配色模板或自动跟随系统。账号菜单仅身份、个人资料、修改密码与退出；网关状态在侧栏底部，连接测试明确为手动检测。
+服务独立持有组件、字体许可、依赖锁和构建产物，不在运行时引用父目录或兄弟服务。网页 UI 仅验收桌面、浏览器缩放、键盘、浅深模式及网关子路径。包含总览、实例列表/独立详情、登录、账号、成员/Token 和双审计；本地构建不代表已发布镜像更新。
 
 审计默认30天，身份存储不受审计清理影响。稳定token身份与目标快照必须留存；旧token升级继续可用，显式停用/吊销才拒绝新请求。
 身份修改与outbox同事务，资源配置副作用记录开始和结果；不得记录密码/token/会话秘密或把跨文件操作写成原子事务。

@@ -1,13 +1,36 @@
-import { useRef, useState, type FormEvent } from "react";
-import { Cable } from "lucide-react";
+import { useId, useState } from "react";
+import {
+  Alert,
+  Button,
+  Col,
+  Form,
+  Input,
+  InputNumber,
+  Row,
+  Select,
+  Space,
+  Switch,
+  Typography,
+} from "antd";
+import { Cable, Save } from "lucide-react";
 import type { InstanceEntry } from "../types";
 import { api, json } from "../api";
-import { Modal } from "./ui/dialog";
-import { Field, Input, PasswordInput } from "./ui/field";
-import { Switch } from "./ui/switch";
-import { Button } from "./ui/button";
-import { Feedback } from "./ui/feedback";
 import { errorText } from "../lib/utils";
+import { AppModal } from "./AppModal";
+import { Feedback } from "./Feedback";
+
+interface InstanceValues {
+  name: string;
+  type: InstanceEntry["type"];
+  host: string;
+  port: number;
+  database: string | number;
+  username: string;
+  schema: string;
+  password: string;
+  permissions: InstanceEntry["permissions"];
+  enabled: boolean;
+}
 
 export function InstanceEditor({
   editing,
@@ -18,43 +41,38 @@ export function InstanceEditor({
   onClose: () => void;
   onSaved: () => void;
 }) {
-  const form = useRef<HTMLFormElement>(null);
-  const [name, setName] = useState(editing?.name || "");
-  const [type, setType] = useState<InstanceEntry["type"]>(
-    editing?.type || "postgres",
-  );
-  const [host, setHost] = useState(editing?.host || "");
-  const [port, setPort] = useState(editing?.port || 5432);
-  const [database, setDatabase] = useState(String(editing?.database ?? ""));
-  const [username, setUsername] = useState(
-    editing?.user || editing?.username || "",
-  );
-  const [schema, setSchema] = useState(editing?.schema || "public");
-  const [password, setPassword] = useState("");
-  const [permissions, setPermissions] = useState<InstanceEntry["permissions"]>(
-    editing?.permissions || "read",
-  );
-  const [enabled, setEnabled] = useState(editing?.enabled ?? true);
+  const [form] = Form.useForm<InstanceValues>();
+  const formId = useId();
+  const type = Form.useWatch("type", form) || editing?.type || "postgres";
+  const permissions = Form.useWatch("permissions", form) || editing?.permissions || "read";
   const [busy, setBusy] = useState<"save" | "test" | "">("");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-  function entry() {
+
+  function entry(values: InstanceValues) {
     return {
-      name: name.trim(),
-      type,
-      host: host.trim(),
-      port,
-      database: type === "redis" ? Number(database) : database.trim(),
-      ...(type === "postgres"
-        ? { user: username.trim(), schema: schema.trim() || "public" }
-        : { username: username.trim() }),
-      permissions,
-      enabled,
-      ...(password ? { password } : {}),
+      name: values.name.trim(),
+      type: values.type,
+      host: values.host.trim(),
+      port: values.port,
+      database:
+        values.type === "redis"
+          ? Number(values.database)
+          : String(values.database).trim(),
+      ...(values.type === "postgres"
+        ? {
+            user: values.username.trim(),
+            schema: values.schema?.trim() || "public",
+          }
+        : { username: values.username?.trim() || "" }),
+      permissions: values.permissions,
+      enabled: values.enabled,
+      ...(values.password ? { password: values.password } : {}),
     };
   }
-  async function save(event: FormEvent) {
-    event.preventDefault();
+
+  async function save(values: InstanceValues) {
+    if (busy) return;
     setBusy("save");
     setError("");
     setMessage("");
@@ -63,7 +81,7 @@ export function InstanceEditor({
         editing
           ? `/api/instances/${encodeURIComponent(editing.name)}`
           : "/api/instances",
-        json(editing ? "PUT" : "POST", entry()),
+        json(editing ? "PUT" : "POST", entry(values)),
       );
       onSaved();
     } catch (error) {
@@ -72,8 +90,15 @@ export function InstanceEditor({
       setBusy("");
     }
   }
+
   async function test() {
-    if (!form.current?.reportValidity()) return;
+    if (busy) return;
+    let values: InstanceValues;
+    try {
+      values = await form.validateFields();
+    } catch {
+      return;
+    }
     setBusy("test");
     setError("");
     setMessage("");
@@ -82,180 +107,193 @@ export function InstanceEditor({
         ok: boolean;
         message?: string;
         error?: string;
-      }>("/api/instances/test", json("POST", entry()));
+      }>("/api/instances/test", json("POST", entry(values)));
       if (result.ok) setMessage(result.message || "连接成功");
-      else setError(result.error || "连接失败");
+      else setError(result.error || result.message || "连接失败");
     } catch (error) {
       setError(errorText(error));
     } finally {
       setBusy("");
     }
   }
+
   return (
-    <Modal
-      open
-      onOpenChange={(open) => {
-        if (!open && !busy) onClose();
+    <AppModal
+      opened
+      onClose={() => {
+        if (!busy) onClose();
       }}
-      wide
+      busy={!!busy}
+      size="lg"
       title={editing ? `编辑 ${editing.name}` : "添加数据库实例"}
-      description="配置 PostgreSQL 或 Redis。密码只写不读，保存后对后续调用生效。"
+      description="配置 PostgreSQL 或 Redis 连接，保存后对后续 MCP 调用生效。"
+      footer={
+        <Space>
+          <Button onClick={onClose} disabled={!!busy}>
+            取消
+          </Button>
+          <Button
+            onClick={() => void test()}
+            disabled={!!busy}
+            loading={busy === "test"}
+            icon={<Cable size={15} aria-hidden="true" />}
+          >
+            测试连接
+          </Button>
+          <Button
+            type="primary"
+            htmlType="submit"
+            form={formId}
+            disabled={!!busy}
+            loading={busy === "save"}
+            icon={<Save size={15} aria-hidden="true" />}
+          >
+            保存配置
+          </Button>
+        </Space>
+      }
     >
-      <form ref={form} onSubmit={save} className="form-stack">
+      <Form<InstanceValues>
+        id={formId}
+        form={form}
+        layout="vertical"
+        disabled={!!busy}
+        onFinish={save}
+        scrollToFirstError={{ focus: true }}
+        initialValues={{
+          name: editing?.name || "",
+          type: editing?.type || "postgres",
+          host: editing?.host || "",
+          port: editing?.port || 5432,
+          database: editing?.database ?? "",
+          username: editing?.user || editing?.username || "",
+          schema: editing?.schema || "public",
+          password: "",
+          permissions: editing?.permissions || "read",
+          enabled: editing?.enabled ?? true,
+        }}
+      >
         <Feedback message={error} />
         <Feedback message={message} success />
-        <fieldset disabled={!!busy} className="form-fields">
-          <div className="form-section">
-            <h3>连接信息</h3>
-            <div className="form-grid">
-              <Field
-                label="实例名称"
-                hint="仅字母、数字、下划线和连字符，保存后不可更名。"
-              >
-                <Input
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  required
-                  pattern="[A-Za-z0-9_-]+"
-                  maxLength={100}
-                  disabled={!!editing}
-                  placeholder="pg-main"
-                />
-              </Field>
-              <Field label="数据库类型">
-                <select
-                  className="input"
-                  value={type}
-                  onChange={(e) => {
-                    const value = e.target.value as InstanceEntry["type"];
-                    setType(value);
-                    setPort(value === "postgres" ? 5432 : 6379);
-                    setDatabase(value === "postgres" ? "" : "0");
-                    setPassword("");
-                  }}
-                >
-                  <option value="postgres">PostgreSQL</option>
-                  <option value="redis">Redis</option>
-                </select>
-              </Field>
-              <Field label="目标主机">
-                <Input
-                  value={host}
-                  onChange={(e) => setHost(e.target.value)}
-                  required
-                  placeholder="IP 或主机名"
-                />
-              </Field>
-              <Field label="端口">
-                <Input
-                  type="number"
-                  min={1}
-                  max={65535}
-                  value={port}
-                  onChange={(e) => setPort(Number(e.target.value))}
-                  required
-                />
-              </Field>
-              <Field
-                label={type === "postgres" ? "数据库名称" : "数据库编号"}
-                hint={type === "redis" ? "从 0 开始的非负整数。" : undefined}
-              >
-                <Input
-                  type={type === "redis" ? "number" : "text"}
-                  min={type === "redis" ? 0 : undefined}
-                  step={type === "redis" ? 1 : undefined}
-                  value={database}
-                  onChange={(e) => setDatabase(e.target.value)}
-                  required
-                  placeholder={type === "postgres" ? "appdb" : "0"}
-                />
-              </Field>
-              <Field
-                label={type === "postgres" ? "连接账号" : "ACL 用户名（可选）"}
-              >
-                <Input
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  required={type === "postgres"}
-                  autoComplete="off"
-                  placeholder={type === "postgres" ? "reader" : "default"}
-                />
-              </Field>
-              {type === "postgres" && (
-                <Field label="默认 Schema">
-                  <Input
-                    value={schema}
-                    onChange={(e) => setSchema(e.target.value)}
-                    placeholder="public"
-                  />
-                </Field>
-              )}
-            </div>
-            <Field
-              label="连接密码"
-              hint={
-                editing?.has_password
-                  ? "已配置密码；留空沿用原密码或环境变量引用。"
-                  : "可使用 ${ENV_VAR} 引用服务端环境变量。"
-              }
+        <Typography.Title level={3}>连接信息</Typography.Title>
+        <Row gutter={16}>
+          <Col span={12}>
+            <Form.Item
+              name="name"
+              label="实例名称"
+              extra="仅字母、数字、下划线和连字符，保存后不可更名。"
+              rules={[
+                { required: true, message: "请输入实例名称" },
+                {
+                  pattern: /^[A-Za-z0-9_-]+$/,
+                  message: "仅支持字母、数字、下划线和连字符",
+                },
+              ]}
             >
-              <PasswordInput
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                autoComplete="new-password"
-                placeholder={editing ? "留空保留原密码" : "输入密码（可选）"}
+              <Input maxLength={100} disabled={!!editing || !!busy} placeholder="pg-main" />
+            </Form.Item>
+          </Col>
+          <Col span={12}>
+            <Form.Item name="type" label="数据库类型">
+              <Select
+                options={[
+                  { value: "postgres", label: "PostgreSQL" },
+                  { value: "redis", label: "Redis" },
+                ]}
+                onChange={(value: InstanceEntry["type"]) => {
+                  form.setFieldsValue({
+                    port: value === "postgres" ? 5432 : 6379,
+                    database: value === "postgres" ? "" : 0,
+                    password: "",
+                  });
+                  setError("");
+                  setMessage("");
+                }}
               />
-            </Field>
-          </div>
-          <div className="form-section">
-            <h3>访问边界</h3>
-            <Field
-              label="工具读写权限"
-              hint="只读实例拒绝写入；PostgreSQL 高危 DDL 仍需调用方显式确认。"
+            </Form.Item>
+          </Col>
+          <Col span={16}>
+            <Form.Item
+              name="host"
+              label="目标主机"
+              rules={[{ required: true, whitespace: true, message: "请输入目标主机" }]}
             >
-              <select
-                className="input"
-                value={permissions}
-                onChange={(e) =>
-                  setPermissions(e.target.value as InstanceEntry["permissions"])
-                }
-              >
-                <option value="read">只读 · read</option>
-                <option value="write">读写 · write</option>
-              </select>
-            </Field>
-            {permissions === "write" && (
-              <p className="muted small">
-                此实例允许 MCP 工具修改数据库内容，请确认连接账号的数据库权限。
-              </p>
-            )}
-            <Switch
-              checked={enabled}
-              onCheckedChange={setEnabled}
-              label="启用实例"
-            />
-          </div>
-        </fieldset>
-        <div className="dialog-actions">
-          <Button type="button" onClick={() => void test()} disabled={!!busy}>
-            <Cable size={16} />
-            {busy === "test" ? "正在检测…" : "测试连接"}
-          </Button>
-          <div className="button-row">
-            <Button
-              type="button"
-              variant="quiet"
-              onClick={onClose}
-              disabled={!!busy}
+              <Input placeholder="IP 或主机名" />
+            </Form.Item>
+          </Col>
+          <Col span={8}>
+            <Form.Item
+              name="port"
+              label="端口"
+              rules={[{ required: true, type: "integer", min: 1, max: 65535, message: "请输入 1–65535 之间的整数端口" }]}
             >
-              取消
-            </Button>
-            <Button type="submit" variant="primary" disabled={!!busy}>
-              {busy === "save" ? "正在保存…" : "保存配置"}
-            </Button>
-          </div>
-        </div>
-      </form>
-    </Modal>
+              <InputNumber min={1} max={65535} precision={0} style={{ width: "100%" }} />
+            </Form.Item>
+          </Col>
+          <Col span={12}>
+            <Form.Item
+              name="database"
+              label={type === "postgres" ? "数据库名称" : "数据库编号"}
+              extra={type === "redis" ? "从 0 开始的非负整数。" : undefined}
+              rules={type === "redis"
+                ? [{ required: true, type: "integer", min: 0, message: "请输入非负整数数据库编号" }]
+                : [{ required: true, whitespace: true, message: "请输入数据库名称" }]}
+            >
+              {type === "redis" ? (
+                <InputNumber min={0} precision={0} placeholder="0" style={{ width: "100%" }} />
+              ) : (
+                <Input placeholder="appdb" />
+              )}
+            </Form.Item>
+          </Col>
+          <Col span={12}>
+            <Form.Item
+              name="username"
+              label={type === "postgres" ? "连接账号" : "ACL 用户名（可选）"}
+              rules={type === "postgres"
+                ? [{ required: true, whitespace: true, message: "请输入连接账号" }]
+                : []}
+            >
+              <Input autoComplete="off" placeholder={type === "postgres" ? "reader" : "default"} />
+            </Form.Item>
+          </Col>
+          {type === "postgres" && (
+            <Col span={12}>
+              <Form.Item name="schema" label="默认 Schema">
+                <Input placeholder="public" />
+              </Form.Item>
+            </Col>
+          )}
+          <Col span={type === "postgres" ? 12 : 24}>
+            <Form.Item
+              name="password"
+              label="连接密码"
+              extra={editing
+                ? `${editing.has_password ? "已配置密码；" : ""}留空沿用原密码或环境变量引用。`
+                : "密码只写不读；可使用 ${ENV_VAR} 引用服务端环境变量。"}
+            >
+              <Input.Password autoComplete="new-password" placeholder={editing ? "留空保留原密码" : "输入密码（可选）"} />
+            </Form.Item>
+          </Col>
+        </Row>
+        <Typography.Title level={3}>访问边界</Typography.Title>
+        <Form.Item name="permissions" label="工具读写权限">
+          <Select options={[
+            { value: "read", label: "只读 · read — 允许读取，拒绝写入" },
+            { value: "write", label: "读写 · write — 允许读取和修改数据库内容" },
+          ]} />
+        </Form.Item>
+        <Alert
+          showIcon
+          type={permissions === "write" ? "warning" : "info"}
+          title={permissions === "write" ? "此实例允许 MCP 工具修改数据库内容，请确认连接账号的数据库权限。" : "只读实例拒绝写入，新增实例默认使用只读权限。"}
+          description="PostgreSQL 只读查询仍由数据库只读事务保护；高危 DDL 仍需调用方显式确认。"
+          style={{ marginBottom: 16 }}
+        />
+        <Form.Item name="enabled" label="实例状态" valuePropName="checked" extra="停用后，MCP 工具将拒绝使用此实例。">
+          <Switch checkedChildren="启用" unCheckedChildren="停用" aria-label="启用实例" />
+        </Form.Item>
+      </Form>
+    </AppModal>
   );
 }

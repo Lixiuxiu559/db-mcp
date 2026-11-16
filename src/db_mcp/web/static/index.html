@@ -1,24 +1,24 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="light" data-palette="mint">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
-    <title>DB MCP · Database Console</title>
+    <title>DB MCP · 数据库控制台</title>
     <script>
       (() => {
-        let mode = "auto";
+        let stored = "light";
         try {
-          const saved = localStorage.getItem("linkage-theme");
-          if (saved === "light" || saved === "dark") mode = saved;
-        } catch { /* 偏好存储可选。 */ }
-        document.documentElement.dataset.theme = mode === "dark" ||
-          (mode === "auto" && matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
-        document.documentElement.dataset.palette = "mint";
+          stored = localStorage.getItem("db-mcp-theme")
+            || localStorage.getItem("mantine-color-scheme-value")
+            || localStorage.getItem("linkage-theme")
+            || "light";
+        } catch {}
+        document.documentElement.dataset.theme = stored === "dark" ? "dark" : "light";
       })();
     </script>
-    <script type="module" crossorigin src="./assets/index-HKg9MiKx.js"></script>
-    <link rel="stylesheet" crossorigin href="./assets/index-BCnEr5Mr.css">
+    <script type="module" crossorigin src="./assets/index-BK77aTrm.js"></script>
+    <link rel="stylesheet" crossorigin href="./assets/index-DF7prYG2.css">
   </head>
   <body>
     <div id="root"></div>

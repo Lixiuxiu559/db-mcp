@@ -1,14 +1,13 @@
-import { useMemo, useState, type FormEvent } from "react";
-import type { ColumnDef } from "@tanstack/react-table";
+import { useEffect, useMemo, useState } from "react";
+import { ArrowUpRight } from "lucide-react";
 import {
-  Download,
-  RefreshCw,
-  Search,
-  ChevronLeft,
-  ChevronRight,
-  ArrowUpRight,
-  X,
-} from "lucide-react";
+  Button,
+  Card,
+  Descriptions,
+  Flex,
+  Select,
+  Typography,
+} from "antd";
 import { response } from "../api";
 import type {
   AuditKind,
@@ -19,10 +18,21 @@ import type {
 } from "../types";
 import { useResource } from "../lib/use-resource";
 import { formatTime, errorText } from "../lib/utils";
-import { DataTable } from "../components/ui/data-table";
-import { Button } from "../components/ui/button";
-import { Feedback, Status } from "../components/ui/feedback";
-import { Modal } from "../components/ui/dialog";
+import { useListPagination } from "../lib/pagination";
+import {
+  personActionLabel,
+  personObjectLabel,
+  personSummaryLabel,
+} from "../lib/audit-labels";
+import { DataTable, type TableColumn } from "../components/DataTable";
+import { Feedback, Status } from "../components/Feedback";
+import { ListNotice } from "../components/ListStates";
+import { PageHeading } from "../components/PageHeading";
+import { AppModal } from "../components/AppModal";
+import { AuditToolbar } from "../components/AuditToolbar";
+
+const { Text, Title } = Typography;
+
 interface Filters {
   q: string;
   days: string;
@@ -39,7 +49,17 @@ const initialFilters: Filters = {
   token_id: "",
   user_id: "",
 };
-const pageSize = 20;
+function hasActiveFilters(filters: Filters) {
+  return Boolean(
+    filters.q ||
+      filters.status ||
+      filters.instance ||
+      filters.token_id ||
+      filters.user_id ||
+      filters.days !== initialFilters.days,
+  );
+}
+
 function text(value: unknown) {
   return value == null || value === ""
     ? "—"
@@ -58,11 +78,13 @@ function filterParams(filters: Filters) {
     );
   return params;
 }
+
 export default function Audit({ kind }: { kind: AuditKind }) {
   const person = kind === "person";
   const [draft, setDraft] = useState(initialFilters);
   const [filters, setFilters] = useState(initialFilters);
-  const [page, setPage] = useState(0);
+  const { pagination, resetPage } = useListPagination();
+  const { current, pageSize } = pagination;
   const [details, setDetails] = useState<AuditRecord | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
@@ -70,13 +92,17 @@ export default function Audit({ kind }: { kind: AuditKind }) {
     const value = filterParams(filters);
     value.set("kind", kind);
     value.set("limit", String(pageSize));
-    value.set("offset", String(page * pageSize));
+    value.set("offset", String((current - 1) * pageSize));
     return value.toString();
-  }, [filters, page, kind]);
+  }, [filters, current, pageSize, kind]);
   const { data, loading, error, reload } = useResource<{
     records: AuditRecord[];
     total: number;
   }>(`/api/audit?${params}`, { records: [], total: 0 });
+  useEffect(() => {
+    if (!loading && !error && current > Math.max(1, Math.ceil(data.total / pageSize)))
+      resetPage();
+  }, [loading, error, current, pageSize, data.total, resetPage]);
   const { data: instances } = useResource<{ instances: InstanceEntry[] }>(
     "/api/instances",
     { instances: [] },
@@ -91,12 +117,12 @@ export default function Audit({ kind }: { kind: AuditKind }) {
   function change<K extends keyof Filters>(key: K, value: Filters[K]) {
     setDraft((old) => ({ ...old, [key]: value }));
   }
-  function search(event: FormEvent) {
-    event.preventDefault();
-    setPage(0);
+  function search() {
+    resetPage();
     setFilters({ ...draft });
   }
   async function exportCsv() {
+    if (exporting) return;
     setExporting(true);
     setExportError("");
     try {
@@ -116,371 +142,378 @@ export default function Audit({ kind }: { kind: AuditKind }) {
       setExporting(false);
     }
   }
-  const columns = useMemo<ColumnDef<AuditRecord, unknown>[]>(
-    () => [
-      {
-        accessorKey: "ts",
-        header: "时间",
-        cell: ({ getValue }) => (
-          <span className="mono small nowrap">
-            {formatTime(getValue() as string)}
-          </span>
-        ),
+  const columns: TableColumn<AuditRecord>[] = [
+    {
+      id: "ts",
+      header: "时间",
+      width: 184,
+      value: (row) => row.ts,
+      render: (row) => <span className="table-time">{formatTime(row.ts)}</span>,
+    },
+    {
+      id: "identity",
+      header: person ? "操作人员" : "调用凭证",
+      width: "16%",
+      render: (row) => (
+        <Flex vertical gap={0} align="center" style={{ minWidth: 0 }}>
+          <Text ellipsis strong>
+            {person
+              ? row.username || row.user || "未认证来源"
+              : row.token_name || row.user || "历史调用"}
+          </Text>
+          {!person && (
+            <Text ellipsis type="secondary" className="mono">
+              {row.token_prefix || row.token_id || "legacy"}
+            </Text>
+          )}
+        </Flex>
+      ),
+    },
+    {
+      id: "action",
+      header: person ? "操作 / 对象" : "工具 / 目标",
+      width: "18%",
+      render: (row) => (
+        <Flex vertical gap={0} align="center" style={{ minWidth: 0 }}>
+          <Text ellipsis strong className={person ? undefined : "mono"}>
+            {person ? personActionLabel(row.action) : text(row.tool)}
+          </Text>
+          <Text ellipsis type="secondary">
+            {person
+              ? personObjectLabel(row, users.users)
+              : row.instance || "网关"}
+          </Text>
+        </Flex>
+      ),
+    },
+    {
+      id: "summary",
+      header: "操作摘要",
+      render: (row) => {
+        const summary = text(
+          person
+            ? personSummaryLabel(row)
+            : row.statement || row.target_host,
+        );
+        return (
+          <Text ellipsis title={summary} className={person ? undefined : "mono"} style={{ display: "block" }}>
+            {summary}
+          </Text>
+        );
       },
-      {
-        id: "identity",
-        header: person ? "操作人员" : "调用凭证",
-        cell: ({ row }) => (
-          <div className="identity-cell">
-            <strong>
-              {person
-                ? row.original.username || row.original.user || "未认证来源"
-                : row.original.token_name || row.original.user || "历史调用"}
-            </strong>
-            <small className="mono">
-              {person
-                ? row.original.actor_user_id || row.original.source_ip || "—"
-                : row.original.token_prefix ||
-                  row.original.token_id ||
-                  "legacy"}
-            </small>
-          </div>
-        ),
-      },
-      {
-        id: "action",
-        header: person ? "动作 / 对象" : "工具 / 目标",
-        cell: ({ row }) => (
-          <div className="identity-cell">
-            <strong className="mono">
-              {text(person ? row.original.action : row.original.tool)}
-            </strong>
-            <small>
-              {person
-                ? `${row.original.object_type || ""} ${row.original.object_id || ""}`
-                : row.original.instance || "网关"}
-            </small>
-          </div>
-        ),
-      },
-      {
-        id: "summary",
-        header: "操作摘要",
-        cell: ({ row }) => (
-          <span
-            className="audit-summary mono"
-            title={text(person ? row.original.summary : row.original.statement)}
-          >
-            {text(
-              person
-                ? row.original.summary
-                : row.original.statement || row.original.target_host,
-            )}
-          </span>
-        ),
-      },
-      {
-        accessorKey: "status",
-        header: "结果",
-        cell: ({ getValue }) => (
-          <Status value={String(getValue() || "pending")} />
-        ),
-      },
-      {
-        accessorKey: "duration_ms",
-        header: "耗时",
-        cell: ({ getValue }) => (
-          <span className="mono small nowrap">
-            {typeof getValue() === "number" ? `${getValue()} ms` : "—"}
-          </span>
-        ),
-      },
-      {
-        id: "details",
-        header: "详情",
-        cell: ({ row }) => (
-          <Button
-            variant="quiet"
-            className="icon-button"
-            aria-label={`查看 ${formatTime(row.original.ts)} 审计详情`}
-            onClick={() => setDetails(row.original)}
-          >
-            <ArrowUpRight size={16} />
-          </Button>
-        ),
-      },
-    ],
-    [person],
-  );
-  const pages = Math.max(1, Math.ceil(data.total / pageSize));
-  const hasFilters = Boolean(
-    filters.q ||
-      filters.status ||
-      filters.instance ||
-      filters.token_id ||
-      filters.user_id ||
-      filters.days !== "7",
-  );
+    },
+    {
+      id: "status",
+      header: "结果",
+      width: 98,
+      sortable: true,
+      value: (row) => row.status ?? "",
+      render: (row) => <Status value={String(row.status || "pending")} />,
+    },
+    {
+      id: "duration_ms",
+      header: "耗时",
+      width: 108,
+      sortable: true,
+      value: (row) => row.duration_ms ?? -1,
+      render: (row) => (
+        <span className="mono nowrap">
+          {typeof row.duration_ms === "number" ? `${row.duration_ms} ms` : "—"}
+        </span>
+      ),
+    },
+    {
+      id: "details",
+      header: "详情",
+      width: 70,
+      align: "center",
+      render: (row) => (
+        <Button
+          type="text"
+          size="small"
+          aria-label={`查看 ${formatTime(row.ts)} 审计详情`}
+          onClick={() => setDetails(row)}
+        >
+          <ArrowUpRight size={16} aria-hidden="true" />
+        </Button>
+      ),
+    },
+  ];
+  const hasFilters = hasActiveFilters(filters);
+  const empty = !loading && !error && data.records.length === 0;
   function clearFilters() {
     setDraft(initialFilters);
     setFilters({ ...initialFilters });
-    setPage(0);
+    resetPage();
   }
   return (
     <>
-      <div className="page-heading">
-        <div>
-          <h1>{person ? "人员操作审计" : "MCP 调用审计"}</h1>
-          <p>
-            {person
-              ? "追溯登录、账号、凭证和资源配置的变更。"
-              : "查看哪个 token 在什么目标上执行了什么操作，以及调用结果。"}
-          </p>
-        </div>
-        <Button onClick={() => void exportCsv()} disabled={exporting}>
-          <Download size={16} />
-          {exporting ? "正在导出…" : "导出 CSV"}
-        </Button>
-      </div>
+      <PageHeading title={person ? "人员操作审计" : "MCP 调用审计"} />
       <Feedback message={exportError} onDismiss={() => setExportError("")} />
-      <section className="panel">
-        <form className="audit-filter" onSubmit={search}>
-          <div className="search-input">
-            <Search size={16} />
-            <input
-              aria-label="搜索审计记录"
-              value={draft.q}
-              placeholder={
-                person ? "动作、对象或人员…" : "SQL、Redis 操作或工具…"
-              }
-              onChange={(e) => change("q", e.target.value)}
-            />
-          </div>
-          <select
-            className="input filter-select"
-            aria-label="审计时间范围"
-            value={draft.days}
-            onChange={(e) => change("days", e.target.value)}
-          >
-            <option value="1">最近 24 小时</option>
-            <option value="7">最近 7 天</option>
-            <option value="30">最近 30 天</option>
-            <option value="all">全部留存记录</option>
-          </select>
-          <select
-            className="input filter-select"
-            aria-label="操作结果"
-            value={draft.status}
-            onChange={(e) => change("status", e.target.value)}
-          >
-            <option value="">全部结果</option>
-            <option value="ok">成功</option>
-            <option value="error">失败</option>
-            <option value="denied">已拒绝</option>
-            <option value="timeout">超时</option>
-            <option value="cancelled">已取消</option>
-            <option value="running">进行中</option>
-            <option value="unknown">结果未知</option>
-          </select>
-          {person ? (
-            <select
-              className="input filter-select"
-              aria-label="操作人员"
-              value={draft.user_id}
-              onChange={(e) => change("user_id", e.target.value)}
-            >
-              <option value="">全部人员</option>
-              {users.users.map((user) => (
-                <option key={user.id} value={user.id}>
-                  {user.display_name || user.username}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <>
-              <select
-                className="input filter-select"
-                aria-label="数据库实例"
-                value={draft.instance}
-                onChange={(e) => change("instance", e.target.value)}
-              >
-                <option value="">全部实例</option>
-                {instances.instances.map((instance) => (
-                  <option key={instance.name} value={instance.name}>
-                    {instance.name}
-                  </option>
-                ))}
-              </select>
-              <select
-                className="input filter-select"
-                aria-label="调用 token"
-                value={draft.token_id}
-                onChange={(e) => change("token_id", e.target.value)}
-              >
-                <option value="">全部 token</option>
-                {tokens.tokens.map((token) => (
-                  <option key={token.id} value={token.id}>
-                    {token.name}
-                  </option>
-                ))}
-              </select>
-            </>
-          )}
-          <div className="button-row">
-            <Button type="submit" variant="primary" disabled={loading}>
-              筛选
-            </Button>
-            <Button
-              type="button"
-              variant="quiet"
-              onClick={clearFilters}
-              aria-label="清除审计筛选"
-            >
-              <X size={15} />
-            </Button>
-            <Button
-              type="button"
-              variant="quiet"
-              onClick={reload}
-              disabled={loading}
-              aria-label="刷新审计"
-            >
-              <RefreshCw size={15} />
-            </Button>
-          </div>
-        </form>
-        <DataTable
-          sortable={false}
-          stickyFirst={false}
-          data={data.records}
-          columns={columns}
+      <Card>
+        <AuditToolbar
+          draft={draft}
+          onChange={change}
+          searchPlaceholder={person ? "动作、对象或人员…" : "SQL、Redis 操作或工具…"}
+          statusValues={["", "ok", "error", "denied", "timeout", "cancelled", "running", "unknown"]}
           loading={loading}
-          error={error}
-          onRetry={reload}
-          empty="当前条件下没有审计记录"
-          emptyHint="尝试调整时间范围或筛选条件。"
-          emptyAction={
-            hasFilters ? (
-              <Button variant="secondary" onClick={clearFilters}>
-                清除筛选
-              </Button>
-            ) : undefined
-          }
+          exporting={exporting}
+          showClear={(hasActiveFilters(draft) || hasFilters) && !(empty && hasFilters)}
+          onSearch={search}
+          onClear={clearFilters}
+          onRefresh={reload}
+          onExport={exportCsv}
+          resourceFilter={!person && (
+            <Select
+              aria-label="目标数据库实例"
+              style={{ width: 150 }}
+              options={[
+                { value: "", label: "全部数据库实例" },
+                ...instances.instances.map((instance) => ({
+                  value: instance.name,
+                  label: instance.name,
+                })),
+              ]}
+              value={draft.instance}
+              onChange={(value) => change("instance", value ?? "")}
+            />
+          )}
+          identityFilter={person ? (
+            <Select
+              aria-label="操作人员"
+              style={{ width: 150 }}
+              options={[
+                { value: "", label: "全部人员" },
+                ...users.users.map((user) => ({
+                  value: user.id,
+                  label: user.display_name || user.username,
+                })),
+              ]}
+              value={draft.user_id}
+              onChange={(value) => change("user_id", value ?? "")}
+            />
+          ) : (
+            <Select
+              aria-label="调用 token"
+              style={{ width: 150 }}
+              options={[
+                { value: "", label: "全部 token" },
+                ...tokens.tokens.map((token) => ({
+                  value: token.id,
+                  label: token.name,
+                })),
+              ]}
+              value={draft.token_id}
+              onChange={(value) => change("token_id", value ?? "")}
+            />
+          )}
         />
-        <div className="table-pagination">
-          <span className="muted small">
-            共 {data.total} 条记录 · 默认保留 30 天
-          </span>
-          <div className="button-row">
-            <Button
-              variant="quiet"
-              className="icon-button"
-              aria-label="上一页"
-              disabled={page === 0 || loading}
-              onClick={() => setPage(page - 1)}
-            >
-              <ChevronLeft size={17} />
-            </Button>
-            <span className="mono small">
-              {page + 1} / {pages}
-            </span>
-            <Button
-              variant="quiet"
-              className="icon-button"
-              aria-label="下一页"
-              disabled={page + 1 >= pages || loading}
-              onClick={() => setPage(page + 1)}
-            >
-              <ChevronRight size={17} />
-            </Button>
-          </div>
-        </div>
-      </section>
-      <p className="page-note">
+        {empty ? (
+          <ListNotice
+            title={
+              hasFilters ? "没有符合筛选条件的记录" : "最近 7 天暂无审计记录"
+            }
+            description={
+              hasFilters
+                ? "调整时间范围或清除筛选条件后再试。"
+                : person
+                  ? "登录后台或变更配置后，这里会显示操作记录。"
+                  : "通过 MCP 客户端调用工具后，这里会显示调用记录。"
+            }
+            onClear={hasFilters ? clearFilters : undefined}
+            action={
+              !hasFilters && (
+                <Button
+                  size="small"
+                  onClick={() => {
+                    const all = { ...initialFilters, days: "all" };
+                    setDraft(all);
+                    setFilters(all);
+                    resetPage();
+                  }}
+                >
+                  查看全部留存记录
+                </Button>
+              )
+            }
+          />
+        ) : (
+          <DataTable
+            sortable={false}
+            pagination={{
+              ...pagination,
+              total: data.total,
+              disabled: loading,
+            }}
+            fixedLayout
+            minWidth={person ? 760 : 840}
+            data={data.records}
+            columns={
+              person
+                ? columns.filter((column) => column.id !== "duration_ms")
+                : columns
+            }
+            rowKey={(row, index) => row.id ?? index}
+            loading={loading}
+            error={error}
+            onRetry={reload}
+          />
+        )}
+      </Card>
+      <Typography.Paragraph type="secondary" style={{ marginTop: 16 }}>
         {person
-          ? "秘密字段仅记录更换动作，不展示密码或 token 明文。"
-          : "Token 标识代表调用凭证，不等同于实际使用者身份。旧版记录保留原始身份，不推测 token 归属。"}
-      </p>
-      <Modal
-        open={!!details}
-        onOpenChange={(open) => {
-          if (!open) setDetails(null);
-        }}
+          ? "秘密字段仅记录更换动作，不展示密码或 Token 明文。"
+          : "Token 标识代表调用凭证，不等同于实际使用者身份。旧版记录保留原始身份，不推测 Token 归属。"}
+        默认保留 30 天。
+      </Typography.Paragraph>
+      <AppModal
+        opened={!!details}
+        onClose={() => setDetails(null)}
         title={person ? "人员操作详情" : "MCP 调用详情"}
-        description="操作发生时保存的身份与目标快照。"
-        wide
+        size="lg"
       >
         {details && (
-          <>
-            <dl className="detail-grid">
-              <dt>时间</dt>
-              <dd className="mono">{formatTime(details.ts)}</dd>
-              <dt>结果</dt>
-              <dd>
-                <Status value={details.status} />
-              </dd>
-              <dt>{person ? "操作人员" : "调用 token"}</dt>
-              <dd>
-                {person
-                  ? details.username || details.user || "未认证来源"
-                  : details.token_name || details.user || "历史调用"}
-              </dd>
-              <dt>{person ? "人员 ID" : "Token ID"}</dt>
-              <dd className="mono wrap">
-                {text(person ? details.actor_user_id : details.token_id)}
-              </dd>
-              <dt>{person ? "动作" : "工具"}</dt>
-              <dd className="mono">
-                {text(person ? details.action : details.tool)}
-              </dd>
-              <dt>{person ? "对象" : "数据库实例"}</dt>
-              <dd className="mono wrap">
-                {person
-                  ? `${details.object_type || ""} ${details.object_id || ""}`
-                  : text(details.instance)}
-              </dd>
-              {!person && (
-                <>
-                  <dt>执行目标快照</dt>
-                  <dd className="mono wrap">
-                    {details.target_host
-                      ? `${details.target_username || ""}@${details.target_host}:${details.target_port || "—"}`
-                      : "旧记录未保存目标快照"}
-                  </dd>
-                  <dt>数据库类型</dt>
-                  <dd className="mono">
-                    {text(details.target_type || details.kind)}
-                  </dd>
-                  <dt>数据库 / 编号</dt>
-                  <dd className="mono wrap">{text(details.target_database)}</dd>
-                  <dt>返回 / 影响行数</dt>
-                  <dd className="mono">{text(details.row_count)}</dd>
-                  <dt>结束时间</dt>
-                  <dd className="mono">{formatTime(details.ended_at)}</dd>
-                  <dt>耗时</dt>
-                  <dd className="mono">
-                    {details.duration_ms == null
-                      ? "—"
-                      : `${details.duration_ms} ms`}
-                  </dd>
-                </>
-              )}
-              <dt>请求编号</dt>
-              <dd className="mono wrap">{text(details.request_id)}</dd>
-              <dt>来源 IP</dt>
-              <dd className="mono">{text(details.source_ip)}</dd>
-            </dl>
-            <div className="detail-block">
-              <h3>{person ? "变更摘要" : "SQL / Redis 操作"}</h3>
-              <pre>{text(person ? details.summary : details.statement)}</pre>
+          <Flex vertical gap={20}>
+            <Descriptions
+              column={1}
+              size="small"
+              items={[
+                {
+                  key: "time",
+                  label: "时间",
+                  children: formatTime(details.ts),
+                },
+                {
+                  key: "status",
+                  label: "结果",
+                  children: <Status value={details.status} />,
+                },
+                {
+                  key: "identity",
+                  label: person ? "操作人员" : "调用 Token",
+                  children: person
+                    ? details.username || details.user || "未认证来源"
+                    : details.token_name || details.user || "历史调用",
+                },
+                {
+                  key: "identity-id",
+                  label: person ? "人员 ID" : "Token ID",
+                  children: (
+                    <Text className="mono wrap-anywhere">
+                      {text(person ? details.actor_user_id : details.token_id)}
+                    </Text>
+                  ),
+                },
+                {
+                  key: "action",
+                  label: person ? "操作" : "工具",
+                  children: person
+                    ? personActionLabel(details.action)
+                    : text(details.tool),
+                },
+                {
+                  key: "object",
+                  label: person ? "对象" : "数据库实例",
+                  children: person
+                    ? personObjectLabel(details, users.users)
+                    : text(details.instance),
+                },
+                ...(person
+                  ? [
+                      {
+                        key: "action-code",
+                        label: "事件代码",
+                        children: text(details.action),
+                      },
+                      {
+                        key: "object-id",
+                        label: "对象 ID",
+                        children: (
+                          <Text className="mono wrap-anywhere">
+                            {text(details.object_id)}
+                          </Text>
+                        ),
+                      },
+                    ]
+                  : []),
+                ...(!person
+                  ? [
+                      {
+                        key: "target",
+                        label: "执行目标快照",
+                        children: (
+                          <Text className="mono wrap-anywhere">
+                            {details.target_host
+                              ? `${details.target_username || ""}@${details.target_host}:${details.target_port || "—"}`
+                              : "旧记录未保存目标快照"}
+                          </Text>
+                        ),
+                      },
+                      {
+                        key: "database-type",
+                        label: "数据库类型",
+                        children: text(details.target_type || details.kind),
+                      },
+                      {
+                        key: "database",
+                        label: "数据库 / 编号",
+                        children: <Text className="mono wrap-anywhere">{text(details.target_database)}</Text>,
+                      },
+                      {
+                        key: "rows",
+                        label: "返回 / 影响行数",
+                        children: text(details.row_count),
+                      },
+                      {
+                        key: "end",
+                        label: "结束时间",
+                        children: formatTime(details.ended_at),
+                      },
+                      {
+                        key: "duration",
+                        label: "耗时",
+                        children:
+                          details.duration_ms == null
+                            ? "—"
+                            : `${details.duration_ms} ms`,
+                      },
+                    ]
+                  : []),
+                {
+                  key: "request",
+                  label: "请求编号",
+                  children: (
+                    <Text className="mono wrap-anywhere">
+                      {text(details.request_id)}
+                    </Text>
+                  ),
+                },
+                {
+                  key: "source",
+                  label: "来源 IP",
+                  children: text(details.source_ip),
+                },
+              ]}
+            />
+            <div>
+              <Title level={5} style={{ marginTop: 0, marginBottom: 8 }}>
+                {person ? "变更摘要" : "SQL / Redis 操作"}
+              </Title>
+              <pre className="detail-pre">
+                {text(
+                  person
+                    ? personSummaryLabel(details)
+                    : details.statement,
+                )}
+              </pre>
               {!person && !!details.statement_truncated && (
-                <p className="muted small">语句超过审计长度上限，已截断。</p>
+                <Text type="secondary">语句超过审计长度上限，已截断。</Text>
               )}
             </div>
             {details.error && <Feedback message={details.error} />}
-          </>
+          </Flex>
         )}
-      </Modal>
+      </AppModal>
     </>
   );
 }
