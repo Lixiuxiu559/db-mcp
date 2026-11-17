@@ -1,7 +1,7 @@
 # db-mcp 开发指引
 
 独立 PostgreSQL / Redis MCP 服务仓库。遵循工作空间最新统一架构和 Ant Design 6 控制台规范，运行、测试、打包不能依赖父目录或兄弟服务。
-当前版本 2.2.0，Python FastMCP 精确 4.1.4。
+当前版本 0.3.0，Python FastMCP 精确 4.1.4。
 
 ## Git 分支
 

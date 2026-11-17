@@ -2,7 +2,7 @@ name: db-mcp
 services:
   db-mcp:
     container_name: ${COMPOSE_PROJECT_NAME:-db-mcp}
-    image: ${DBMCP_IMAGE:-lijx559/db-mcp:2.2.0}
+    image: ${DBMCP_IMAGE:-lijx559/db-mcp:0.3.0}
     restart: unless-stopped
     ports:
       - "${DBMCP_BIND_ADDRESS:-127.0.0.1}:${DBMCP_PORT:-8807}:8807"

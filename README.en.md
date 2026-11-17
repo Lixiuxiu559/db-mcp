@@ -57,12 +57,12 @@ A self-hosted MCP gateway for PostgreSQL and Redis. Manage connections centrally
 Requires Docker Engine or Docker Desktop. Pull the image and start it; Git, Python, Node.js, an `.env` file, and a pre-created configuration are not required. Choose either `docker run` or Compose below.
 
 ```bash
-docker pull lijx559/db-mcp:2.2.0
+docker pull lijx559/db-mcp:0.3.0
 docker run -d --name db-mcp \
   --restart unless-stopped \
   -p 127.0.0.1:8807:8807 \
   -v db-mcp-data:/data \
-  lijx559/db-mcp:2.2.0
+  lijx559/db-mcp:0.3.0
 ```
 
 Open **http://127.0.0.1:8807/** and sign in with **`admin / admin`** on a new installation. The image creates a default configuration if missing and creates the default account only when the identity database has no users. Existing accounts, passwords, workspaces, Tokens, and audit data are preserved.
@@ -79,7 +79,7 @@ Save this single `compose.yaml` file:
 name: db-mcp
 services:
   db-mcp:
-    image: lijx559/db-mcp:2.2.0
+    image: lijx559/db-mcp:0.3.0
     container_name: db-mcp
     restart: unless-stopped
     ports:
@@ -223,8 +223,8 @@ The CLI supports `--config`, `--host`, `--port`, and `--data-dir`. Containers ad
 
 ```bash
 uv build
-uvx --from ./dist/db_mcp-2.2.0-py3-none-any.whl db-mcp --init --config /absolute/path/db-mcp/config.yaml
-uvx --from ./dist/db_mcp-2.2.0-py3-none-any.whl db-mcp --config /absolute/path/db-mcp/config.yaml
+uvx --from ./dist/db_mcp-0.3.0-py3-none-any.whl db-mcp --init --config /absolute/path/db-mcp/config.yaml
+uvx --from ./dist/db_mcp-0.3.0-py3-none-any.whl db-mcp --config /absolute/path/db-mcp/config.yaml
 ```
 
 Local wheels/sdists include default configuration and console assets. Keep runtime data outside installation caches. uvx does not use the source `uv.lock`; package availability follows the release records.

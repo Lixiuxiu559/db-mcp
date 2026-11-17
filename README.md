@@ -57,12 +57,12 @@
 需要 Docker Engine 或 Docker Desktop。直接拉取镜像启动，无需 Git、Python、Node.js、`.env` 或预先创建配置文件。下面的 `docker run` 与 Compose 二选一。
 
 ```bash
-docker pull lijx559/db-mcp:2.2.0
+docker pull lijx559/db-mcp:0.3.0
 docker run -d --name db-mcp \
   --restart unless-stopped \
   -p 127.0.0.1:8807:8807 \
   -v db-mcp-data:/data \
-  lijx559/db-mcp:2.2.0
+  lijx559/db-mcp:0.3.0
 ```
 
 打开 **http://127.0.0.1:8807/**，首次登录使用 **`admin / admin`**。镜像会在缺少配置时自动生成默认配置；只有身份库没有用户时才创建默认账号。已有账号、密码、工作空间、Token 与审计不会被重置。
@@ -79,7 +79,7 @@ docker run -d --name db-mcp \
 name: db-mcp
 services:
   db-mcp:
-    image: lijx559/db-mcp:2.2.0
+    image: lijx559/db-mcp:0.3.0
     container_name: db-mcp
     restart: unless-stopped
     ports:
@@ -223,8 +223,8 @@ CLI 支持 `--config`、`--host`、`--port`、`--data-dir`；容器默认增加 
 
 ```bash
 uv build
-uvx --from ./dist/db_mcp-2.2.0-py3-none-any.whl db-mcp --init --config /absolute/path/db-mcp/config.yaml
-uvx --from ./dist/db_mcp-2.2.0-py3-none-any.whl db-mcp --config /absolute/path/db-mcp/config.yaml
+uvx --from ./dist/db_mcp-0.3.0-py3-none-any.whl db-mcp --init --config /absolute/path/db-mcp/config.yaml
+uvx --from ./dist/db_mcp-0.3.0-py3-none-any.whl db-mcp --config /absolute/path/db-mcp/config.yaml
 ```
 
 本地 wheel/sdist 包含默认配置与管理页面，运行数据放在安装缓存之外。uvx 不使用源码的 `uv.lock`；包发布状态以发布记录为准。

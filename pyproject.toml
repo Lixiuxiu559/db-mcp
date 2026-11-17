@@ -1,6 +1,6 @@
 [project]
 name = "db-mcp"
-version = "2.2.0"
+version = "0.3.0"
 description = "团队共享数据库网关 MCP 服务：集中托管 PostgreSQL / Redis 实例凭据，按实例分级读写权限"
 readme = "README.md"
 requires-python = ">=3.10"
