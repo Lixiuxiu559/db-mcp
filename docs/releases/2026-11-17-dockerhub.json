@@ -1,0 +1,82 @@
+{
+  "published_at": "2026-11-17T10:11:42+00:00",
+  "release_date": "2026-11-17",
+  "repository": "lijx559/db-mcp",
+  "version": "0.3.0",
+  "tags": [
+    "0.3.0",
+    "latest"
+  ],
+  "public": true,
+  "index_digest": "sha256:6da8031fafa9e8cffcb7faef37f002b70e19296780418db4ad9b039784aaf8f5",
+  "previous_latest_digest": "sha256:bf50ceda7ef5a4678b543efe2253194658509c655dca505327bd3efb1255f9cc",
+  "base_index_digest": "sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b",
+  "source_revision": "12e49306afe19d46f98b2fcab7679fea285a701b",
+  "source_dirty": false,
+  "source_fingerprint": "77565f33eb7b5494bff5335a2275233b392ad5b136a3503b8a1afc51bbe8c7e1",
+  "images": [
+    {
+      "platform": "linux/amd64",
+      "manifest_digest": "sha256:2002ea588f3b1d462ae662ba231eaaa6fcf2efaf5ade8a3112d7a4f8acb32cd5",
+      "config_digest": "sha256:3f1735a2d4950c4da4026b63145dc9df5bdad6eb62a0382e277423925e09ef38",
+      "anonymous_pull_verified": true
+    },
+    {
+      "platform": "linux/arm64",
+      "manifest_digest": "sha256:7a4c5060340a98cb5d34ca13b3efe2f7fa23797a0d73526412a71e9dffb94cea",
+      "config_digest": "sha256:206c82a7e6be22c4c99bc269f10ef975db96a2584e78df6f3c503067ffd50946",
+      "anonymous_pull_verified": true
+    }
+  ],
+  "validation": {
+    "pytest_passed": 418,
+    "ruff": "passed",
+    "anonymous_pull": "both platforms passed",
+    "container_matrix": [
+      {
+        "platform": "linux/amd64",
+        "method": "run",
+        "fresh_start": true,
+        "default_account": true,
+        "nonroot": true,
+        "config_mode": "0600",
+        "token_key_mode": "0600",
+        "recreate_keeps_config_password_workspace_token_and_audit": true,
+        "no_env_file": true
+      },
+      {
+        "platform": "linux/amd64",
+        "method": "compose",
+        "fresh_start": true,
+        "default_account": true,
+        "nonroot": true,
+        "config_mode": "0600",
+        "token_key_mode": "0600",
+        "recreate_keeps_config_password_workspace_token_and_audit": true,
+        "no_env_file": true
+      },
+      {
+        "platform": "linux/arm64",
+        "method": "run",
+        "fresh_start": true,
+        "default_account": true,
+        "nonroot": true,
+        "config_mode": "0600",
+        "token_key_mode": "0600",
+        "recreate_keeps_config_password_workspace_token_and_audit": true,
+        "no_env_file": true
+      },
+      {
+        "platform": "linux/arm64",
+        "method": "compose",
+        "fresh_start": true,
+        "default_account": true,
+        "nonroot": true,
+        "config_mode": "0600",
+        "token_key_mode": "0600",
+        "recreate_keeps_config_password_workspace_token_and_audit": true,
+        "no_env_file": true
+      }
+    ]
+  }
+}
