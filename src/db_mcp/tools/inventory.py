@@ -8,8 +8,10 @@ import time
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 
+from ..auth.scope import current_workspace
 from ..config import PostgresInstance, RedisInstance
 from ..dependencies import get_state
+from ..errors import InstanceDisabledError, InstanceNotFoundError, PermissionDeniedError
 from ..models import InstanceInfo, InstanceListResult, PingResult
 from ..state import DbState
 
@@ -25,16 +27,16 @@ def register(mcp: FastMCP) -> None:
     async def list_instances(
         state: DbState = Depends(get_state),
     ) -> InstanceListResult:
-        """列出所有已配置的数据库实例及其类型、读写权限和启用状态。
+        """列出当前工作空间的数据库实例及其类型、读写权限和启用状态。
 
-        返回所有实例的摘要信息，帮助了解当前可用的数据库资源。后续所有工具都用
+        返回已分配实例的摘要信息，帮助了解当前可用的数据库资源。后续所有工具都用
         instance 参数指定实例，开始任务时建议先调用本工具。
 
         Returns:
             实例列表，每项含 name / type / permissions / enabled / 连接信息。
         """
         instances = []
-        for name, inst in state.config.instances.items():
+        for name, inst in state.config.visible_instances(current_workspace()).items():
             info = InstanceInfo(
                 name=name,
                 type=inst.type,  # type: ignore[arg-type]
@@ -62,13 +64,14 @@ def register(mcp: FastMCP) -> None:
         Args:
             instance: 实例名称（先用 list_instances 获取）。
         """
-        inst = state.config.resolve_instance(instance)
+        inst = state.config.resolve_instance(instance, current_workspace())
         limits = state.config.limits
 
         async def op(conn):
             start = time.monotonic()
             if isinstance(inst, PostgresInstance):
                 async with conn.acquire() as c:
+                    await state.authorize_attempt(instance, inst)
                     version = await c.fetchval("SELECT version()")
             else:
                 info = conn.info()
@@ -82,6 +85,8 @@ def register(mcp: FastMCP) -> None:
                 state.pool.run_with_retry(instance, inst, op),
                 timeout=limits.connect_timeout_seconds + 5,
             )
+        except (InstanceDisabledError, InstanceNotFoundError, PermissionDeniedError):
+            raise
         except Exception as exc:  # noqa: BLE001 - 连通性检查：任何失败都转成结构化结果
             return PingResult(
                 instance=instance, status="error", error=f"{type(exc).__name__}: {exc}"

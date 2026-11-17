@@ -21,6 +21,8 @@ from typing import Any
 from fastmcp.server.dependencies import get_access_token, get_http_request
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 
+from .auth.scope import call_scope
+
 _LOG = logging.getLogger(__name__)
 _MAX_TEXT = 16_384
 _SECRET_KEYS = re.compile(
@@ -51,7 +53,8 @@ def raise_if_cancelled() -> None:
 
 _MCP_FIELDS = (
     "id", "ts", "ended_at", "service_id", "user", "token_id", "token_name", "token_prefix",
-    "tool", "instance", "kind", "target_type", "target_host", "target_port", "target_database",
+    "workspace_id", "workspace_name", "tool", "instance", "kind", "target_type", "target_host",
+    "target_port", "target_database",
     "target_username", "statement", "statement_truncated", "row_count", "result_truncated",
     "request_id", "source_ip", "status", "duration_ms", "error", "legacy_id",
 )
@@ -73,7 +76,7 @@ _PERSON_FIELDS = (
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS mcp_calls (
  id TEXT PRIMARY KEY, ts TEXT NOT NULL, ended_at TEXT, service_id TEXT,
- user TEXT, token_id TEXT, token_name TEXT, token_prefix TEXT,
+ user TEXT, token_id TEXT, token_name TEXT, token_prefix TEXT, workspace_id TEXT, workspace_name TEXT,
  tool TEXT, instance TEXT, kind TEXT, target_type TEXT, target_host TEXT, target_port INTEGER,
  target_database TEXT, target_username TEXT, statement TEXT, statement_truncated INTEGER DEFAULT 0,
  row_count INTEGER, result_truncated INTEGER DEFAULT 0, request_id TEXT, source_ip TEXT,
@@ -124,14 +127,6 @@ def redact(value: Any, secrets: tuple[str, ...] = ()) -> Any:
     return _SECRET_ARG.sub(r"\1[已脱敏]", text)
 
 
-def current_user() -> str:
-    try:
-        token = get_access_token()
-        return token.client_id if token else "anonymous"
-    except Exception:  # noqa: BLE001 - optional request context
-        return "anonymous"
-
-
 class AuditLogger:
     def __init__(self, path: Path, retention_days: int = 30, max_statement_chars: int = 4000):
         self.path = Path(path)
@@ -173,6 +168,10 @@ class AuditLogger:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
                 conn.executescript(_SCHEMA)
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(mcp_calls)")}
+                for field in ("workspace_id", "workspace_name"):
+                    if field not in columns:
+                        conn.execute(f"ALTER TABLE mcp_calls ADD COLUMN {field} TEXT")
                 self._migrate_legacy(conn)
                 conn.commit()
             except BaseException:
@@ -484,22 +483,28 @@ async def record_attempt(attempt: int, status: str, error: str | None = None) ->
 
 
 def _context_identity(state: Any) -> tuple[dict[str, Any], tuple[str, ...]]:
-    identity = {"user": current_user()}
+    identity = {"user": "anonymous"}
     secrets: list[str] = []
     try:
         token = get_access_token()
-        if token:
-            identity["token_id"] = token.client_id
-            value = getattr(token, "token", None)
-            if value:
-                secrets.append(value)
-            if state is not None:
-                info = state.identity.token_info(token.client_id)
-                if info:
-                    identity.update(token_name=info.get("name"), token_prefix=info.get("prefix"))
-    except Exception:  # noqa: BLE001 - optional identity enrichment
-        _LOG.debug("认证上下文不可用")
+    except RuntimeError:
+        token = None
     if state is not None:
+        if token is not None and token.token:
+            secrets.append(token.token)
+            item = state.identity.verify_token(token.token)
+            if item and item["id"] == token.client_id:
+                identity.update(
+                    user=item["id"], token_id=item["id"], token_name=item["name"],
+                    token_prefix=item["prefix"], workspace_id=item["workspace_id"],
+                    workspace_name=item["workspace_name"],
+                )
+            elif (item := state.identity.token_for_audit(token.token)) and item["id"] == token.client_id:
+                # 只保留已失效凭证的历史身份；不赋予 workspace/scope 或任何访问权限。
+                identity.update(
+                    user=item["id"], token_id=item["id"], token_name=item["name"],
+                    token_prefix=item["prefix"],
+                )
         for instance in state.config.instances.values():
             value = instance.password.get_secret_value()
             if value:
@@ -542,6 +547,13 @@ _REDIS_CMD_NAMES = {
     "redis_zset_range": "ZRANGE", "redis_zset_add": "ZADD", "redis_zset_remove": "ZREM",
 }
 
+_REDIS_CONTROL_DEFAULTS = {
+    "redis_scan": {"match": "*", "count": 100, "cursor": "0"},
+    "redis_list_range": {"start": 0, "stop": -1},
+    "redis_list_pop": {"count": 1},
+    "redis_zset_range": {"start": 0, "stop": -1, "with_scores": True},
+}
+
 
 def _statement_from_args(args: dict[str, Any]) -> str | None:
     if isinstance(args.get("sql"), str):
@@ -560,9 +572,18 @@ def _statement_from_args(args: dict[str, Any]) -> str | None:
         cmd = "LPOP" if args.get("left", True) else "RPOP"
     elif tool == "redis_zset_range" and args.get("desc"):
         cmd = "ZREVRANGE"
-    target = args.get("key") or args.get("pattern") or args.get("keys")
+    target = next((args[key] for key in ("key", "pattern", "keys") if key in args), None)
+    if tool == "redis_keys":
+        target = args.get("pattern", "*")
+    if target == "":
+        target = '""'
     # Redis 写入值和 SQL params 均不复制到审计；命令、目标与非正文控制参数可读。
-    control = {key: args[key] for key in ("fields", "ttl", "seconds", "start", "stop", "cursor", "count") if key in args}
+    control = dict(_REDIS_CONTROL_DEFAULTS.get(tool, {}))
+    control.update({
+        key: args[key]
+        for key in ("fields", "ttl", "seconds", "start", "stop", "cursor", "count", "match", "with_scores")
+        if key in args
+    })
     statement = cmd if target is None else f"{cmd} {target}"
     return statement + (" " + json.dumps(control, ensure_ascii=False) if control else "")
 
@@ -599,6 +620,7 @@ class AuditMiddleware(Middleware):
         from .errors import (
             ConfirmationRequiredError,
             InstanceDisabledError,
+            InstanceNotFoundError,
             PermissionDeniedError,
             StatementNotAllowedError,
         )
@@ -608,12 +630,14 @@ class AuditMiddleware(Middleware):
         args["__tool__"] = context.message.name
         record = {
             **identity, "ts": _now(), "tool": context.message.name,
-            "instance": args.get("instance"), "kind": _kind_of(context.message.name),
+            "instance": args["instance"] if isinstance(args.get("instance"), str) else None,
+            "kind": _kind_of(context.message.name),
             "statement": redact(_statement_from_args(args), secrets),
         }
-        if self._state is not None:
+        workspace_id = identity.get("workspace_id")
+        if self._state is not None and workspace_id:
             target = self._state.config.get_instance(str(args.get("instance") or ""))
-            if target:
+            if target and workspace_id in target.workspace_ids:
                 record.update(_target_fields(target))
         if context.fastmcp_context is not None:
             try:
@@ -630,9 +654,16 @@ class AuditMiddleware(Middleware):
         call_id = await self._audit.begin_call(record)
         call_secrets = list(secrets)
         scope = _CALL.set((self._audit, call_id, call_secrets))
+        workspace_scope = call_scope.set(
+            (identity["token_id"], workspace_id) if workspace_id else None
+        )
         outcome: dict[str, Any] = {"status": "unknown"}
         try:
             raise_if_cancelled()
+            if self._state is not None and not workspace_id:
+                raise PermissionDeniedError("MCP Token 无效、已停用、已到期或缺少有效的工作空间")
+            if {"workspace_id", "workspace_ids"} & args.keys():
+                raise PermissionDeniedError("工具调用不能指定工作空间")
             result = await call_next(context)
             raise_if_cancelled()
             outcome["status"] = "error" if getattr(result, "is_error", False) else "ok"
@@ -647,14 +678,17 @@ class AuditMiddleware(Middleware):
             outcome.update(status="cancelled", error="请求已取消；数据库操作是否完成需另行核实")
             raise
         except Exception as exc:
-            if isinstance(exc, (PermissionDeniedError, StatementNotAllowedError,
-                                ConfirmationRequiredError, InstanceDisabledError)):
+            if isinstance(exc, (
+                PermissionDeniedError, StatementNotAllowedError, ConfirmationRequiredError,
+                InstanceDisabledError, InstanceNotFoundError,
+            )):
                 status = "denied"
             else:
                 status = "timeout" if "timeout" in type(exc).__name__.lower() else "error"
             outcome.update(status=status, error=redact(f"{type(exc).__name__}: {exc}", call_secrets))
             raise
         finally:
+            call_scope.reset(workspace_scope)
             _CALL.reset(scope)
             outcome["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
             await self._audit.finish_call(call_id, outcome)

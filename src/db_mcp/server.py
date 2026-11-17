@@ -13,7 +13,7 @@ from .tools import inventory, postgres, redis
 from .web.api import register_web_routes
 
 INSTRUCTIONS = (
-    "团队共享的数据库网关，可操作多台已配置的 PostgreSQL / Redis 实例。\n"
+    "团队共享的数据库网关，可操作当前 Token 所属工作空间中已分配的 PostgreSQL / Redis 实例。\n"
     "流程：先用 list_instances 获取实例名（instance）与读写权限，之后所有工具都用它指定实例：\n"
     "- 连通性排查: db_ping\n"
     "- PostgreSQL 只读查询: postgres_query（禁止写操作）\n"

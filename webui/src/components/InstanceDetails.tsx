@@ -4,6 +4,8 @@ import type { ColumnsType } from "antd/es/table";
 import { ArrowLeft, ArrowRight, Cable, Database, Network, Pencil, RefreshCw, Terminal } from "lucide-react";
 import type { AuditRecord, InstanceEntry } from "../types";
 import { useResource } from "../lib/use-resource";
+import type { WorkspaceEntry } from "../console-types";
+import { WorkspaceLabels } from "./WorkspaceAccess";
 import { useListPagination } from "../lib/pagination";
 import { formatCompactTime, formatTime } from "../lib/utils";
 import { AppTable } from "./AppTable";
@@ -16,9 +18,10 @@ export interface ConnectionCheck {
 }
 
 export function InstanceDetails({
-  instance, check, busy, onBack, onTest, onEdit, onDelete,
+  instance, workspaces, check, busy, onBack, onTest, onEdit, onDelete,
 }: {
   instance: InstanceEntry;
+  workspaces: WorkspaceEntry[];
   check?: ConnectionCheck;
   busy: boolean;
   onBack: () => void;
@@ -47,6 +50,7 @@ export function InstanceDetails({
   const type = instance.type === "postgres" ? "PostgreSQL" : "Redis";
   const permission = instance.permissions === "write" ? "读写 · write" : "只读 · read";
   const fields = [
+    { key: "workspaces", label: "工作空间", children: <WorkspaceLabels ids={instance.workspace_ids} workspaces={workspaces} /> },
     { key: "type", label: "数据库类型", children: type },
     { key: "host", label: "目标主机", children: <span className="wrap-anywhere">{instance.host}</span> },
     { key: "port", label: "端口", children: instance.port },

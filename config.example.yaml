@@ -1,5 +1,5 @@
 # db-mcp 配置文件样例。复制为 config.yaml 后修改。
-# 密码/token 建议用 ${ENV_VAR} 引用环境变量（缺变量时启动会直接报错）；
+# 数据库密码 建议用 ${ENV_VAR} 引用环境变量（缺变量时启动会直接报错）；
 # $$ 表示字面 $。
 
 server:
@@ -11,8 +11,7 @@ auth:
   session_hours: 8
   cookie_secure: false        # HTTPS 部署设 true
   cookie_path: /              # 网关子路径部署可设 /项目-db-mcp/
-  # 旧版本 auth.users 仅供旧 MCP token 首次幂等迁移，不能用于网页登录。
-  # 新安装不配置人员或 token；启动后通过本机 setup.key 创建首位用户。
+  # 首次启动无用户时自动创建 admin/admin，再从后台建立工作空间并签发 Token。
 
 audit:
   path: audit/audit.db     # SQLite 审计库
@@ -38,6 +37,7 @@ instances:
     database: appdb
     user: app_readonly
     password: ${DBMCP_PG_MAIN_PASSWORD}
+    workspace_ids: []        # 在后台选择所属工作空间；留空时 MCP 客户端不可访问
     permissions: read        # read | write
     enabled: true
     # schema: public         # 默认 schema（list_tables/describe_table 缺省用）

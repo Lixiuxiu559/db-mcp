@@ -94,15 +94,19 @@ curl -fsS http://127.0.0.1:8807/healthz
 
 Run `--init` only for the first deployment: it creates an empty configuration and never overwrites an existing file. Skip initialization when upgrading. Once health returns `{"ok":true}`, open **http://127.0.0.1:8807/**.
 
-### 4. Create the first user
+### 4. Sign in with the installation defaults
 
-```bash
-docker compose exec db-mcp cat /data/data/setup.key
-```
+The current source and images built from it automatically create username **`admin`** and password **`admin`** on the first installation startup when the identity database has no users. No setup code is required. Source, Docker/Compose, installed packages, and uvx share this rule. The versioned images above require a separate release to include this change.
 
-Enter the one-time setup code in the web console and choose a username and separate password. The setup file is deleted after initialization. There is no default web account.
+You can change the password from the account menu after signing in. Creating, changing, or resetting a password requires **6–1024 characters**; the installation default is the only length exception. Existing users prevent default-account creation or password resets. Restarts and upgrades preserve existing accounts, passwords, and valid MCP tokens.
 
 Add a PostgreSQL or Redis instance, choose read-only or read/write access, and test the connection. Then create a client-specific token in MCP Token. The container must be able to reach the database; database account privileges still apply.
+
+### Workspaces in the current source
+
+The workspace feature is included in the current source and local web build. Use the current source or a locally built image for this feature. The versioned images in the quick start above require a separate release to include these changes.
+
+Create a project in Workspaces, add each database instance, and select one or more workspaces for it. Creating a client token requires exactly one workspace. The client can only list and operate on resources assigned to that workspace. Choose read-only or read/write access for each instance. The container must reach the target database, and database account privileges still apply.
 
 ### Compose configuration
 
@@ -127,6 +131,8 @@ Inside a container, `127.0.0.1` refers to that container. For resources on the h
 
 Create and save a token in the console, then add a configuration to an HTTP-capable MCP client:
 
+Claude Code uses the project's `.mcp.json` file.
+
 ```json
 {
   "mcpServers": {
@@ -137,6 +143,14 @@ Create and save a token in the console, then add a configuration to an HTTP-capa
     }
   }
 }
+```
+
+Codex uses `~/.codex/config.toml` or a trusted project's `.codex/config.toml`.
+
+```toml
+[mcp_servers.db-mcp]
+url = "http://127.0.0.1:8807/mcp"
+http_headers = { Authorization = "Bearer <MCP_TOKEN>" }
 ```
 
 This example assumes the client and gateway run on the same machine. Remote clients should use the gateway's actual HTTPS URL. Users of an existing deployment do not need a separate gateway process. Call `list_instances` first to discover resource names.
@@ -155,7 +169,9 @@ Each instance uses `permissions: read` or `write`, defaulting to `read`. Only on
 ## People, credentials, and audit
 
 - Web access uses username/password, HttpOnly session cookies, and CSRF protection. All enabled users have equal management access.
-- MCP tokens are separate from users. A new token is shown in plaintext only once; subsequent views expose metadata only. Tokens authorize `/mcp`, not web login.
+- The console manages all workspaces and resources. Each database instance is created once and can belong to multiple workspaces. Unassigned resources are inaccessible to MCP tokens. A token belongs to exactly one workspace, fixed at creation. Removing a resource assignment blocks subsequent calls from that workspace, including established MCP sessions.
+- A workspace with assigned resources or undeleted tokens, including disabled tokens, cannot be deleted. Changes to shared connection settings affect every workspace using the resource.
+- MCP tokens are separate from users. The current source supports copying newly issued tokens from the list and generating Claude Code or Codex connection settings. Tokens are stored as verification hashes plus encrypted copies; ordinary list responses expose metadata only. Older hash-only tokens cannot be recovered and must be recreated to enable copying. Tokens authorize `/mcp`, not web login.
 - Restarts, upgrades, and container replacement preserve valid tokens. Creating a token, disabling its creator, or deleting its creator does not revoke other tokens. Password changes, disabling, and deletion revoke that user's web sessions. Member switches save immediately; deletion requires confirmation and at least one enabled member must remain. With another enabled member present, you can disable or delete your own account and will be signed out.
 - Token switches directly enable or disable access. Confirmed deletion permanently invalidates the credential and removes it from the management list while retaining its tombstone and audit history.
 - Management audit records logins and configuration changes. MCP audit records token identity, actual instance type/host/port/database/account and SQL or Redis operation, outcome, and duration. Retention defaults to 30 days, with filters, details, and CSV export.
@@ -170,9 +186,9 @@ Each instance uses `permissions: read` or `write`, defaulting to `read`. Only on
 | Host path | Contents |
 |---|---|
 | `runtime/config.yaml` | Service and resource configuration. |
-| `runtime/data/service.db` | Users, sessions, and token verification hashes. |
+| `runtime/data/service.token.key` | Persistent encryption key for token copying; back up and restore with the identity database. |
+| `runtime/data/service.db` | Users, sessions, workspaces, token assignments, verification hashes, and encrypted copies. |
 | `runtime/audit/audit.db` | Management and MCP audit records. |
-| `runtime/data/setup.key` | Exists only before first-user initialization. |
 
 Keep these files, `.env`, and `backups/` out of Git. Preserve the entire `runtime/` directory across upgrades and container replacement.
 
@@ -186,7 +202,7 @@ docker compose down
 
 ### Back up and update
 
-Stop the service before backing up the full directory, including SQLite WAL/SHM files, or use a reliable SQLite online backup procedure.
+Stop the service before backing up the full directory, including SQLite WAL/SHM files and `data/service.token.key`, or use a reliable SQLite online backup procedure and preserve the matching encryption key. A missing or damaged key blocks copying and new token issuance without changing existing hash authentication.
 
 ```bash
 mkdir -p backups
@@ -203,7 +219,7 @@ docker compose up -d
 docker compose ps
 ```
 
-Explicitly configured legacy `auth.users` tokens are imported idempotently and remain usable for MCP. Empty configurations do not create default credentials. Web users and MCP tokens are managed separately. Legacy `audit_records` are retained without inventing historical identities. Rehearse migrations on a backup copy. Rollback requires a compatible image, configuration, and data backup; do not delete the identity database or regenerate tokens to fix login problems.
+Workspace access is designed for a fresh deployment. After initialization, create workspaces, assign resources, and issue tokens in the console. Legacy `auth.users` credentials are not imported automatically, and tokens without a workspace cannot call MCP. Routine restarts and upgrades preserve workspaces and valid credentials. Historical audit attribution is retained. Backups and rollback still require matching configuration and data.
 
 ### HTTPS and reverse proxy
 
@@ -228,7 +244,7 @@ Set `auth.cookie_secure: true` and `auth.cookie_path: /db-mcp/` in `runtime/conf
 | Remote browsers cannot open the console | Default binding is local; use HTTPS proxying, an SSH tunnel, or an explicit network binding. |
 | Web login works but MCP authentication fails | Web accounts and MCP tokens are separate; create a token in the MCP Token page. |
 | Resources are unreachable from the container | Check networking, target addresses, and firewalls; avoid accidentally targeting the container's own loopback. |
-| The setup code file no longer exists | It is removed after initialization; sign in with an existing username and password. |
+| How to sign in after installation | Current source creates `admin / admin` on first startup if no users exist; existing installations keep their credentials. |
 
 ## Other installation options
 
@@ -286,3 +302,8 @@ docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 [Development guide](CLAUDE.md) · [Published digests](docs/releases/2026-10-30-dockerhub.md) · [Report an issue](https://github.com/Lixiuxiu559/db-mcp/issues)
 
 This service is independently developed, released, and deployed. It shares conventions with the [MCP workspace](https://github.com/Lixiuxiu559/mcp) and has no runtime dependency on a parent directory or another MCP repository.
+
+### Credential expiry and field limits in the current source
+
+- In the current source, Token creation and editing support an optional expiry time in the browser time zone. Leave it empty for no expiry. Expired tokens reject new MCP requests and calls; staff may still copy or explicitly adjust the expiry. Copying never restores access. Restarting preserves the expiry, and deleted tokens cannot be revived.
+- Usernames, display names, and Token names allow up to 128 Unicode characters; Token descriptions allow up to 1000. Sign-in and editing share these limits.

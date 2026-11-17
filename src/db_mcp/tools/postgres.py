@@ -17,6 +17,7 @@ import time
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 
+from ..auth.scope import current_workspace
 from ..config import PostgresInstance
 from ..db.pool import as_timeout_error
 from ..dependencies import get_state
@@ -53,7 +54,7 @@ _TABLE_TYPE_MAP = {
 
 def _pg(state: DbState, name: str) -> PostgresInstance:
     """取实例并确认它是 postgres 类型。"""
-    inst = state.config.resolve_instance(name)
+    inst = state.config.resolve_instance(name, current_workspace())
     if not isinstance(inst, PostgresInstance):
         raise StatementNotAllowedError(
             f"实例 {name!r} 是 {inst.type} 类型，PostgreSQL 工具不能用于它。"
@@ -391,7 +392,10 @@ async def _execute_read(
     from ..db import pg as pgmod
 
     async def op(pool):
-        return await pgmod.run(pool, sql, params, read_only=True, max_rows=max_rows)
+        return await pgmod.run(
+            pool, sql, params, read_only=True, max_rows=max_rows,
+            authorize=lambda: state.authorize_attempt(name, inst),
+        )
 
     return await state.pool.run_with_retry(name, inst, op)
 
@@ -402,7 +406,10 @@ async def _execute_write(
     from ..db import pg as pgmod
 
     async def op(pool):
-        return await pgmod.run(pool, sql, params, read_only=False, max_rows=max_rows)
+        return await pgmod.run(
+            pool, sql, params, read_only=False, max_rows=max_rows,
+            authorize=lambda: state.authorize_attempt(name, inst),
+        )
 
     return await state.pool.run_with_retry(name, inst, op)
 

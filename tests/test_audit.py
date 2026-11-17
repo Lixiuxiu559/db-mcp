@@ -5,8 +5,11 @@ from __future__ import annotations
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastmcp import Client
 from httpx2 import ASGITransport, AsyncClient
+
+pytestmark = pytest.mark.usefixtures("inprocess_auth")
 
 
 def read_records(audit_path):
@@ -20,11 +23,8 @@ def read_records(audit_path):
 
 async def _web_get(gw, path: str, token: str = ""):
     # 网页只接受人员会话；legacy MCP token 不能作为网页凭证。
-    identity = gw.state.identity
-    if identity.setup_required:
-        identity.initialize("audit-reader", "test-password-123", identity.setup_key_path.read_text())
     async with AsyncClient(transport=ASGITransport(app=gw.mcp.http_app()), base_url="http://t") as client:
-        login = await client.post("/api/auth/login", json={"username": "audit-reader", "password": "test-password-123"})
+        login = await client.post("/api/auth/login", json={"username": "admin", "password": "admin"})
         assert login.status_code == 200
         return await client.get(path)
 
@@ -45,7 +45,7 @@ async def test_audit_records_sql_plaintext(gw, tmp_path):
     assert rec["statement"] == "SELECT * FROM users WHERE id = 7"
     assert rec["statement_truncated"] == 0
     assert rec["status"] == "ok"
-    assert rec["user"] == "anonymous"  # in-memory 无 HTTP 认证
+    assert rec["user"] == gw.token["id"]
     assert rec["duration_ms"] >= 0
 
 
@@ -66,7 +66,7 @@ async def test_audit_records_failures(gw, tmp_path):
         )
 
     rec = read_records(tmp_path / "audit" / "audit.db")[0]
-    assert rec["status"] == "error"
+    assert rec["status"] == "denied"
     assert "InstanceNotFoundError" in rec["error"]
     # 失败时语句仍然记录，便于定位"谁尝试执行了什么"
     assert rec["statement"] == "SELECT 1"
@@ -135,9 +135,9 @@ async def test_audit_filter_by_instance_and_status(gw):
     assert body["total"] == 1
     assert body["records"][0]["statement"] == "SELECT 1"
 
-    body = (await _web_get(gw, "/api/audit?status=error", "tok-alice")).json()
+    body = (await _web_get(gw, "/api/audit?status=denied", "tok-alice")).json()
     assert body["total"] == 1
-    assert body["records"][0]["status"] == "error"
+    assert body["records"][0]["status"] == "denied"
 
 
 async def test_audit_keyword_filter(gw):

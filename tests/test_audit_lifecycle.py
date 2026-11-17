@@ -20,8 +20,8 @@ def context(tool="postgres_query", **arguments):
     )
 
 
-async def test_target_and_token_snapshots(gw, monkeypatch):
-    value, token = gw.state.identity.create_token("ci-runner", "creator-id")
+async def test_target_and_token_snapshots(gw, inprocess_auth, monkeypatch):
+    value, token = gw.state.identity.create_token("ci-runner", "creator-id", gw.workspace_id)
     monkeypatch.setattr(
         "db_mcp.audit.get_access_token",
         lambda: SimpleNamespace(client_id=token["id"], token=value),
@@ -51,7 +51,7 @@ async def test_target_and_token_snapshots(gw, monkeypatch):
     assert record["target_host"] == "10.0.0.30"
 
 
-async def test_actual_pool_target_overrides_start_snapshot(gw, monkeypatch):
+async def test_actual_pool_target_overrides_start_snapshot(gw, inprocess_auth, monkeypatch):
     """开始事件落库期间发生配置热更新时，实际执行目标必须覆盖旧快照。"""
     original_begin = gw.state.audit.begin_call
 
@@ -69,7 +69,7 @@ async def test_actual_pool_target_overrides_start_snapshot(gw, monkeypatch):
     assert record["target_host"] == "10.0.0.99"
 
 
-async def test_redis_target_and_no_write_value_capture(gw):
+async def test_redis_target_and_no_write_value_capture(gw, inprocess_auth):
     async with Client(gw.mcp) as client:
         await client.call_tool(
             "redis_set", {"instance": "redis-write", "key": "user:1", "value": "private-body"}
@@ -81,7 +81,7 @@ async def test_redis_target_and_no_write_value_capture(gw):
     assert "private-body" not in str(record)
 
 
-async def test_sensitive_sql_and_driver_error_redaction(gw, monkeypatch):
+async def test_sensitive_sql_and_driver_error_redaction(gw, inprocess_auth, monkeypatch):
     async with Client(gw.mcp) as client:
         await client.call_tool(
             "postgres_query", {"instance": "pg-read", "sql": "SELECT 'pg-pw'"}
@@ -131,7 +131,7 @@ async def test_cancellation_finishes_call_and_attempt(tmp_path):
     audit.close()
 
 
-async def test_timeout_and_policy_denial(gw):
+async def test_timeout_and_policy_denial(gw, inprocess_auth):
     middleware = AuditMiddleware(gw.state.audit, gw.state)
 
     async def timeout(_):
@@ -150,7 +150,7 @@ async def test_timeout_and_policy_denial(gw):
     assert record["statement"] == "UPDATE t SET x=1"
 
 
-async def test_reconnect_attempts_share_call_id(gw, harness, monkeypatch):
+async def test_reconnect_attempts_share_call_id(gw, inprocess_auth, harness, monkeypatch):
     original = harness.pg_rows
     failed = False
 
@@ -312,7 +312,7 @@ async def test_delayed_duplicate_start_cannot_overwrite_finished_outcome(tmp_pat
     audit.close()
 
 
-async def test_password_changed_during_start_does_not_leak_in_driver_error(gw, monkeypatch):
+async def test_password_changed_during_start_does_not_leak_in_driver_error(gw, inprocess_auth, monkeypatch):
     original_begin = gw.state.audit.begin_call
 
     async def begin(record):

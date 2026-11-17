@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -60,11 +61,13 @@ async def run(
     *,
     read_only: bool,
     max_rows: int,
+    authorize: Callable[[], Awaitable[None]],
 ) -> PgResult:
     """执行一条 SQL。调用方负责权限校验与超时控制。"""
     args = list(params or [])
     try:
         async with pool.acquire() as conn:
+            await authorize()
             if read_only:
                 return await _run_read(conn, sql, args, max_rows)
             return await _run_write(conn, sql, args)

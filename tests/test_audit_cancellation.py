@@ -15,7 +15,7 @@ from db_mcp.audit import AuditMiddleware
     ("phase", "expected_operations"), [("update", 0), ("write", 0), ("complete", 1)]
 )
 async def test_cancel_during_slow_audit_thread_stays_cancelled(
-    gw, monkeypatch, phase, expected_operations
+    gw, inprocess_auth, monkeypatch, phase, expected_operations
 ):
     original_to_thread = asyncio.to_thread
     entered = asyncio.Event()

@@ -9,6 +9,8 @@ from __future__ import annotations
 import pytest
 from fastmcp import Client
 
+pytestmark = pytest.mark.usefixtures("inprocess_auth")
+
 
 async def call(gw, name: str, **args):
     async with Client(gw.mcp) as client:
@@ -219,7 +221,8 @@ async def test_read_instance_uses_readonly_transaction(gw, harness):
     inst = gw.state.config.get_instance("pg-read")
 
     async def op(pool):
-        return await pgmod.run(pool, "UPDATE t SET a = 1", None, read_only=True, max_rows=10)
+        return await pgmod.run(pool, "UPDATE t SET a = 1", None, read_only=True, max_rows=10,
+                               authorize=lambda: gw.state.authorize_attempt("pg-read", inst))
 
     with pytest.raises(Exception) as exc:
         await gw.state.pool.run_with_retry("pg-read", inst, op)
@@ -235,7 +238,8 @@ async def test_readonly_error_translated_to_readable(gw, harness):
     inst = gw.state.config.get_instance("pg-read")
 
     async def op(pool):
-        return await pgmod.run(pool, "UPDATE t SET a = 1", None, read_only=True, max_rows=10)
+        return await pgmod.run(pool, "UPDATE t SET a = 1", None, read_only=True, max_rows=10,
+                               authorize=lambda: gw.state.authorize_attempt("pg-read", inst))
 
     with pytest.raises(PermissionDeniedError) as exc:
         await gw.state.pool.run_with_retry("pg-read", inst, op)

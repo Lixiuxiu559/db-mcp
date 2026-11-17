@@ -14,6 +14,7 @@ import asyncio
 from fastmcp import FastMCP
 from fastmcp.dependencies import Depends
 
+from ..auth.scope import current_workspace
 from ..config import RedisInstance
 from ..db.pool import as_timeout_error
 from ..dependencies import get_state
@@ -37,7 +38,7 @@ from ..state import DbState
 
 def _redis(state: DbState, name: str) -> RedisInstance:
     """取实例并确认它是 redis 类型。"""
-    inst = state.config.resolve_instance(name)
+    inst = state.config.resolve_instance(name, current_workspace())
     if not isinstance(inst, RedisInstance):
         raise StatementNotAllowedError(
             f"实例 {name!r} 是 {inst.type} 类型，Redis 工具不能用于它。"

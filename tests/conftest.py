@@ -22,20 +22,10 @@ import pytest
 from db_mcp.config import ConfigFile
 from db_mcp.server import create_mcp
 
-_ALICE_TOKEN = "tok-alice"
-_BOB_TOKEN = "tok-bob"
-
 _CONFIG = """
 server:
   host: 127.0.0.1
   port: 8807
-auth:
-  users:
-    - username: alice
-      token: ${TEST_ALICE_TOKEN}
-      admin: true
-    - username: bob
-      token: ${TEST_BOB_TOKEN}
 audit:
   path: __AUDIT_PATH__/audit.db
   max_statement_chars: 200
@@ -491,8 +481,6 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
 
 def make_mcp_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """写临时配置文件并构建 mcp/state（含环境变量）。"""
-    monkeypatch.setenv("TEST_ALICE_TOKEN", _ALICE_TOKEN)
-    monkeypatch.setenv("TEST_BOB_TOKEN", _BOB_TOKEN)
     monkeypatch.setenv("TEST_PG_PASSWORD", "pg-pw")
 
     def _make(extra_config: str = "") -> SimpleNamespace:
@@ -514,4 +502,27 @@ def make_mcp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 @pytest.fixture
 def gw(harness, make_mcp):
     """标准网关：默认配置（4 个可用实例）+ 假驱动。"""
-    return make_mcp()
+    gateway = make_mcp()
+    gateway.workspace_id = gateway.state.identity.save_workspace("测试项目")["id"]
+    for entry in gateway.cfg_file.raw["instances"].values():
+        entry["workspace_ids"] = [gateway.workspace_id]
+    gateway.cfg_file.save()
+    gateway.state.replace_config(gateway.cfg_file.load())
+    gateway.secret, gateway.token = gateway.state.identity.create_token(
+        "test-client", "test-creator", gateway.workspace_id
+    )
+    return gateway
+
+
+@pytest.fixture
+def inprocess_auth(gw, monkeypatch):
+    # 仅为无 HTTP transport 的工具单测显式提供已签发凭证。
+    from db_mcp.auth.scope import call_scope
+
+    token = SimpleNamespace(client_id=gw.token["id"], token=gw.secret)
+    monkeypatch.setattr("db_mcp.audit.get_access_token", lambda: token)
+    scope = call_scope.set((gw.token["id"], gw.workspace_id))
+    try:
+        yield
+    finally:
+        call_scope.reset(scope)

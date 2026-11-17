@@ -22,6 +22,7 @@ import redis.asyncio as aioredis
 from ..audit import raise_if_cancelled, record_attempt, record_target
 from ..config import (
     GatewayConfig,
+    InstanceConfig,
     PostgresInstance,
     RedisInstance,
 )
@@ -41,7 +42,11 @@ _RETRYABLE = (
 
 
 class ConnectionPool:
-    def __init__(self, config_fn: Callable[[], GatewayConfig]):
+    def __init__(
+        self, config_fn: Callable[[], GatewayConfig],
+        authorize: Callable[[str, InstanceConfig], Awaitable[None]],
+    ):
+        self._authorize = authorize
         self._config_fn = config_fn
         self._pg: dict[str, Any] = {}
         self._redis: dict[str, Any] = {}
@@ -121,7 +126,7 @@ class ConnectionPool:
 
     async def get_pg_pool(self, name: str, inst: PostgresInstance) -> Any:
         async with self._lock(f"pg:{name}"):
-            signature = inst.model_dump()
+            signature = inst.connection_signature()
             pool = self._pg.get(name)
             if pool is not None and self._pg_signatures.get(name) != signature:
                 self._pg.pop(name, None)
@@ -129,6 +134,7 @@ class ConnectionPool:
                 await _close_quietly(pool)
                 pool = None
             if pool is None:
+                await self._authorize(name, inst)
                 pool = await self._connect_pg(name, inst)
                 self._pg[name] = pool
                 self._pg_signatures[name] = signature
@@ -136,7 +142,7 @@ class ConnectionPool:
 
     async def get_redis_client(self, name: str, inst: RedisInstance) -> Any:
         async with self._lock(f"redis:{name}"):
-            signature = inst.model_dump()
+            signature = inst.connection_signature()
             client = self._redis.get(name)
             if client is not None and self._redis_signatures.get(name) != signature:
                 self._redis.pop(name, None)
@@ -144,6 +150,7 @@ class ConnectionPool:
                 await _close_quietly(client)
                 client = None
             if client is None:
+                await self._authorize(name, inst)
                 client = await self._connect_redis(name, inst)
                 self._redis[name] = client
                 self._redis_signatures[name] = signature
@@ -184,13 +191,16 @@ class ConnectionPool:
     ) -> T:
         """在缓存连接上执行操作；遇连接级错误则失效重连再试一次。"""
         async with self._semaphore(name):
+            await self._authorize(name, inst)
             await record_target(inst)
             for attempt in (1, 2):
                 try:
                     await record_attempt(attempt, "running")
                     raise_if_cancelled()
+                    await self._authorize(name, inst)
                     conn = await self._get(name, inst)
                     raise_if_cancelled()
+                    await self._authorize(name, inst)
                     result = await op(conn)
                     raise_if_cancelled()
                 except asyncio.CancelledError:

@@ -5,6 +5,8 @@ import { Cable, Pencil, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import { api, json } from "../api";
 import type { InstanceEntry } from "../types";
 import { useResource } from "../lib/use-resource";
+import { useWorkspaces } from "../lib/use-workspaces";
+import { WorkspaceLabels } from "../components/WorkspaceAccess";
 import { useListPagination } from "../lib/pagination";
 import { errorText } from "../lib/utils";
 import { AppTable } from "../components/AppTable";
@@ -15,7 +17,9 @@ import { PageHeading } from "../components/PageHeading";
 import { InstanceDetails, type ConnectionCheck } from "../components/InstanceDetails";
 import { InstanceEditor } from "../components/InstanceEditor";
 
-export default function Instances() {
+export default function Instances({ onManageWorkspaces }: { onManageWorkspaces: () => void }) {
+  const workspaceResource = useWorkspaces();
+  const workspaces = workspaceResource.data.workspaces;
   const { data, setData, loading, error, reload } = useResource<{
     instances: InstanceEntry[];
   }>("/api/instances", { instances: [] });
@@ -105,6 +109,11 @@ export default function Instances() {
     });
   }
 
+  function refreshList() {
+    reload();
+    workspaceResource.reload();
+  }
+
   function saved() {
     const name = editor?.name;
     if (name) setChecks((old) => {
@@ -114,7 +123,7 @@ export default function Instances() {
     });
     if (!data.instances.length) clearFilters();
     setEditor(undefined);
-    reload();
+    refreshList();
     setMessage("实例配置已保存。");
   }
 
@@ -132,6 +141,10 @@ export default function Instances() {
           <Typography.Text type="secondary">{instance.type === "postgres" ? "PostgreSQL" : "Redis"}</Typography.Text>
         </Flex>
       ),
+    },
+    {
+      key: "workspaces", title: "工作空间", width: 170,
+      render: (_, instance) => <WorkspaceLabels ids={instance.workspace_ids} workspaces={workspaces} />,
     },
     {
       key: "host", title: "目标端点", width: 220,
@@ -180,7 +193,7 @@ export default function Instances() {
       <Feedback message={deleting ? "" : actionError} onDismiss={() => setActionError("")} />
       <Feedback message={message} success onDismiss={() => setMessage("")} />
       {selected ? (
-        <InstanceDetails key={selected.name} instance={selected} check={checks[selected.name]} busy={!!busy}
+        <InstanceDetails workspaces={workspaces} key={selected.name} instance={selected} check={checks[selected.name]} busy={!!busy}
           onBack={backToList} onTest={() => void test(selected)} onEdit={() => setEditor(selected)}
           onDelete={() => { setDeleting(selected); setActionError(""); }} />
       ) : (
@@ -200,11 +213,13 @@ export default function Instances() {
                 {hasFilters && <Button type="text" onClick={clearFilters}>重置筛选</Button>}
                 <Flex gap={12} align="center" style={{ marginLeft: "auto" }}>
                   <Typography.Text type="secondary" className="nowrap">共 {filtered.length} 个实例</Typography.Text>
-                  <Button type="text" aria-label="刷新实例列表" loading={loading} icon={<RefreshCw size={15} aria-hidden="true" />} onClick={reload} />
+                  <Button type="text" aria-label="刷新实例列表" loading={loading} icon={<RefreshCw size={15} aria-hidden="true" />} onClick={refreshList} />
                   <Button type="primary" icon={<Plus size={15} aria-hidden="true" />} onClick={() => setEditor(null)}>添加实例</Button>
                 </Flex>
               </Flex>
               <Feedback message={error} />
+              <Feedback message={workspaceResource.error ? `工作空间加载失败：${workspaceResource.error}` : ""} />
+              {workspaceResource.error && <Button onClick={workspaceResource.reload} style={{ marginBottom: 16 }}>重试加载工作空间</Button>}
               {error && <Button onClick={reload} style={{ marginBottom: 16 }}>重试</Button>}
               {!filtered.length && !loading && !error ? (
                 <ListNotice title={hasFilters ? "没有匹配的数据库实例" : "添加第一个数据库实例"}
@@ -213,16 +228,16 @@ export default function Instances() {
                   action={!hasFilters ? <Button type="primary" icon={<Plus size={15} aria-hidden="true" />} onClick={() => setEditor(null)}>添加实例</Button> : undefined} />
               ) : (
                 <AppTable<InstanceEntry> aria-label="数据库实例列表" dataSource={filtered} columns={columns} rowKey="name"
-                  loading={loading} pagination={{ ...pagination, total: filtered.length }} tableLayout="fixed" scroll={{ x: 1125 }} />
+                  loading={loading} pagination={{ ...pagination, total: filtered.length }} tableLayout="fixed" scroll={{ x: 1295 }} />
               )}
               <Typography.Paragraph type="secondary" style={{ margin: "16px 0 0" }}>
-                检测结果来自手动连接测试。连接密码仅由网关持有，不向 MCP 客户端返回。
+                未分配工作空间的实例无法通过 MCP Token 访问。检测结果来自手动连接测试。连接密码仅由网关持有，不向 MCP 客户端返回。
               </Typography.Paragraph>
             </Card>
           )}
         </>
       )}
-      {editor !== undefined && <InstanceEditor editing={editor} onClose={() => setEditor(undefined)} onSaved={saved} />}
+      {editor !== undefined && <InstanceEditor onManageWorkspaces={onManageWorkspaces} editing={editor} onClose={() => setEditor(undefined)} onSaved={saved} />}
       <AppModal opened={!!deleting} busy={!!busy} onClose={() => { if (!busy) setDeleting(null); }} title="删除实例配置"
         footer={<Space><Button onClick={() => setDeleting(null)} disabled={!!busy}>取消</Button><Button danger type="primary" loading={busy === "delete"} disabled={!!busy} onClick={() => void remove()}>删除配置</Button></Space>}>
         <Typography.Paragraph>

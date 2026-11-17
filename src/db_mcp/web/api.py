@@ -18,6 +18,7 @@ from starlette.responses import FileResponse, JSONResponse, Response
 
 from ..audit import raise_if_cancelled, redact
 from ..auth import IdentityError
+from ..auth.store import WorkspaceConflict
 from ..config import (
     ConfigError,
     InstanceConfig,
@@ -27,6 +28,13 @@ from ..config import (
 )
 from ..errors import DbMcpError
 from ..state import DbState
+from .person_audit import (
+    PersonAuditMode,
+    call_outbox,
+    call_outbox_async,
+    ensure_outbox_recorded,
+    validate_audit_mode,
+)
 
 _INDEX_HTML = Path(__file__).parent / "static" / "index.html"
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -41,6 +49,7 @@ def _instance_payload(name: str, inst: InstanceConfig) -> dict[str, Any]:
         "type": inst.type,
         "host": inst.host,
         "port": inst.port,
+        "workspace_ids": inst.workspace_ids,
         "permissions": inst.permissions,
         "enabled": inst.enabled,
         "has_password": bool(inst.password.get_secret_value()),
@@ -120,7 +129,11 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
             raise IdentityError("请求体必须是 JSON 对象")
         return value
 
-    def route(path, methods, *, action=None, public=False, object_type=None):
+    def route(
+        path, methods, *, action=None, public=False, object_type=None, audit_mode=None
+    ):
+        validate_audit_mode(action, audit_mode)
+
         def decorate(handler):
             @wraps(handler)
             async def wrapped(request):
@@ -128,6 +141,7 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
                 request.state.user = None
                 request.state.identity_event = None
                 request.state.outbox_recorded = False
+                request.state.person_audit_mode = audit_mode
                 if public and request.method == "POST":
                     content_type = request.headers.get("content-type", "").split(";", 1)[0]
                     if content_type != "application/json":
@@ -145,6 +159,7 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
                                     status="denied",
                                     error="网页登录认证失败",
                                     object_type=object_type,
+                                    object_id=next(iter(request.path_params.values()), None),
                                 )
                             )
                         return JSONResponse({"detail": "请使用用户名和密码登录"}, status_code=401)
@@ -161,6 +176,7 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
                                         status="denied",
                                         error="CSRF校验失败",
                                         object_type=object_type,
+                                        object_id=next(iter(request.path_params.values()), None),
                                     )
                                 )
                             return JSONResponse(
@@ -178,18 +194,21 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
                     else None
                 )
                 request.state.identity_event = record
-                external_audit = bool(action and action.startswith(("instance.", "config.", "audit.")))
-                if external_audit:
+                lifecycle_audit = audit_mode is PersonAuditMode.LIFECYCLE
+                if lifecycle_audit:
                     await state.audit.begin_person(record)
                 try:
                     # 审计兜底可能完成落库；取消的请求不能继续触发外部副作用。
                     raise_if_cancelled()
                     response = await handler(request)
+                    ensure_outbox_recorded(request, response.status_code)
                 except asyncio.CancelledError:
-                    if external_audit:
+                    if lifecycle_audit:
                         record.update(status="cancelled", error="请求取消，外部操作结果未知")
                         await state.audit.finish_person(record)
                     raise
+                except WorkspaceConflict as exc:
+                    response = JSONResponse({"detail": str(exc)}, status_code=409)
                 except IdentityError as exc:
                     response = JSONResponse({"detail": str(exc)}, status_code=400)
                 except ConfigError:
@@ -216,7 +235,7 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
                     ):
                         record["username"] = request.state.attempted_username
                     # Identity mutations have a transactional outbox. Others are written directly.
-                    if external_audit:
+                    if lifecycle_audit:
                         await state.audit.finish_person(record)
                     elif not getattr(request.state, "outbox_recorded", False):
                         await state.audit.log_person(record)
@@ -267,17 +286,19 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
             {"setup_required": await asyncio.to_thread(lambda: state.identity.setup_required)}
         )
 
-    @route("/api/auth/setup", ["POST"], action="user.initialize", public=True, object_type="user")
+    @route(
+        "/api/auth/setup", ["POST"], action="user.initialize", public=True, object_type="user",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
     async def setup(request):
         value = await read_body(request)
-        user = await asyncio.to_thread(
+        user = await call_outbox(
+            request,
             state.identity.initialize,
             value.get("username", ""),
             value.get("password", ""),
             value.get("setup_key", ""),
-            request.state.identity_event,
         )
-        request.state.outbox_recorded = True
         request.state.user = user
         user, session, csrf = await asyncio.to_thread(
             state.identity.login, user["username"], value["password"]
@@ -286,7 +307,10 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
         set_session(response, session)
         return response
 
-    @route("/api/auth/login", ["POST"], action="user.login", public=True, object_type="user")
+    @route(
+        "/api/auth/login", ["POST"], action="user.login", public=True, object_type="user",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
     async def login(request):
         value = await read_body(request)
         username = value.get("username", "")
@@ -295,12 +319,14 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
         if not isinstance(username, str) or not isinstance(value.get("password"), str):
             raise IdentityError("用户名或密码错误")
         try:
-            user, session, csrf = await asyncio.to_thread(
-                state.identity.login, username, value["password"], request.state.identity_event
+            user, session, csrf = await call_outbox(
+                request,
+                state.identity.login,
+                username,
+                value["password"],
             )
         except IdentityError:
             return JSONResponse({"detail": "用户名或密码错误"}, status_code=401)
-        request.state.outbox_recorded = True
         response = JSONResponse({"user": user, "csrf_token": csrf})
         set_session(response, session)
         return response
@@ -309,57 +335,112 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
     async def me(request):
         return JSONResponse({"user": request.state.user, "csrf_token": request.state.csrf_token})
 
-    @route("/api/auth/logout", ["POST"], action="user.logout", object_type="session")
+    @route(
+        "/api/auth/logout", ["POST"], action="user.logout", object_type="session",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
     async def logout(request):
-        await asyncio.to_thread(
-            state.identity.logout, request.cookies.get(_COOKIE, ""), request.state.identity_event
+        await call_outbox(
+            request,
+            state.identity.logout,
+            request.cookies.get(_COOKIE, ""),
         )
-        request.state.outbox_recorded = True
         response = JSONResponse({"ok": True})
-        response.delete_cookie(_COOKIE, path=state.config.auth.cookie_path)
+        response.delete_cookie(
+            _COOKIE,
+            path=state.config.auth.cookie_path,
+            secure=state.config.auth.cookie_secure,
+            httponly=True,
+            samesite="strict",
+        )
         return response
 
     @route("/api/users", ["GET"])
     async def list_users(request):
         return JSONResponse({"users": await asyncio.to_thread(state.identity.list_users)})
 
-    @route("/api/users", ["POST"], action="user.create", object_type="user")
+    @route(
+        "/api/users", ["POST"], action="user.create", object_type="user",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
     async def create_user(request):
         value = await read_body(request)
-        item = await asyncio.to_thread(
+        item = await call_outbox(
+            request,
             state.identity.create_user,
             value.get("username", ""),
             value.get("password", ""),
             value.get("display_name", ""),
-            request.state.identity_event,
         )
-        request.state.outbox_recorded = True
         return JSONResponse(item, status_code=201)
 
-    @route("/api/users/{id}", ["PATCH"], action="user.update", object_type="user")
+    @route(
+        "/api/users/{id}", ["PATCH"], action="user.update", object_type="user",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
     async def update_user(request):
         value = await read_body(request)
         changes = {k: v for k, v in value.items() if k in {"display_name", "password", "enabled"}}
         request.state.identity_event["summary"] = ", ".join(
             "密码已更换" if k == "password" else k for k in changes
         )
-        item = await asyncio.to_thread(
+        item = await call_outbox(
+            request,
             state.identity.update_user,
             request.path_params["id"],
             changes,
-            request.state.identity_event,
         )
-        request.state.outbox_recorded = True
         return JSONResponse(item)
 
-    @route("/api/users/{id}", ["DELETE"], action="user.delete", object_type="user")
+    @route(
+        "/api/users/{id}", ["DELETE"], action="user.delete", object_type="user",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
     async def delete_user(request):
-        await asyncio.to_thread(
+        await call_outbox(
+            request,
             state.identity.delete_user,
             request.path_params["id"],
-            request.state.identity_event,
         )
-        request.state.outbox_recorded = True
+        return JSONResponse({"ok": True})
+
+    @route("/api/workspaces", ["GET"])
+    async def list_workspaces(request):
+        return JSONResponse({"workspaces": await asyncio.to_thread(state.identity.list_workspaces)})
+
+    @route(
+        "/api/workspaces", ["POST"], action="workspace.create", object_type="workspace",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
+    async def create_workspace(request):
+        body = await read_body(request)
+        item = await call_outbox(
+            request,
+            state.identity.save_workspace,
+            body.get("name"),
+        )
+        return JSONResponse({"workspace": item}, status_code=201)
+
+    @route(
+        "/api/workspaces/{id}", ["PATCH"], action="workspace.update", object_type="workspace",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
+    async def update_workspace(request):
+        body = await read_body(request)
+        item = await call_outbox(
+            request,
+            state.identity.save_workspace,
+            body.get("name"),
+            workspace_id=request.path_params["id"],
+        )
+        return JSONResponse({"workspace": item})
+
+    @route(
+        "/api/workspaces/{id}", ["DELETE"], action="workspace.delete", object_type="workspace",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
+    async def delete_workspace(request):
+        await call_outbox_async(request, state.delete_workspace, request.path_params["id"])
         return JSONResponse({"ok": True})
 
     @route("/api/tokens", ["GET"])
@@ -367,40 +448,64 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
         tokens = await asyncio.to_thread(state.identity.list_tokens, include_deleted=False)
         return JSONResponse({"tokens": tokens})
 
-    @route("/api/tokens", ["POST"], action="token.create", object_type="token")
+    @route(
+        "/api/tokens", ["POST"], action="token.create", object_type="token",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
     async def create_token(request):
         value = await read_body(request)
-        token, item = await asyncio.to_thread(
+        token, item = await call_outbox(
+            request,
             state.identity.create_token,
             value.get("name", ""),
             request.state.user["id"],
+            value.get("workspace_id"),
             value.get("description", ""),
-            request.state.identity_event,
+            expires_at=value.get("expires_at"),
         )
-        request.state.outbox_recorded = True
         return JSONResponse({"token": token, "item": item}, status_code=201)
 
-    @route("/api/tokens/{id}", ["PATCH"], action="token.update", object_type="token")
+    @route(
+        "/api/tokens/{id}/reveal", ["POST"], action="token.copy", object_type="token",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
+    async def reveal_token(request):
+        request.state.identity_event["summary"] = "复制 MCP Token"
+        token = await call_outbox(
+            request,
+            state.identity.reveal_token,
+            request.path_params["id"],
+        )
+        return JSONResponse({"token": token})
+
+    @route(
+        "/api/tokens/{id}", ["PATCH"], action="token.update", object_type="token",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
     async def update_token(request):
         value = await read_body(request)
-        changes = {k: v for k, v in value.items() if k in {"name", "description", "enabled"}}
+        changes = {k: v for k, v in value.items()
+                   if k in {"name", "description", "enabled", "workspace_id", "expires_at"}}
         request.state.identity_event["summary"] = ", ".join(changes)
-        item = await asyncio.to_thread(
+        item = await call_outbox(
+            request,
             state.identity.update_token,
             request.path_params["id"],
             changes,
-            request.state.identity_event,
         )
-        request.state.outbox_recorded = True
         return JSONResponse(item)
 
-    @route("/api/tokens/{id}", ["DELETE"], action="token.delete", object_type="token")
+    @route(
+        "/api/tokens/{id}", ["DELETE"], action="token.delete", object_type="token",
+        audit_mode=PersonAuditMode.OUTBOX,
+    )
     async def delete_token(request):
         request.state.identity_event["summary"] = "删除 MCP Token"
-        await asyncio.to_thread(
-            state.identity.delete_token, request.path_params["id"], request.state.identity_event
+        await call_outbox(
+            request,
+            state.identity.delete_token,
+            request.path_params["id"],
         )
-        request.state.outbox_recorded = True
         return JSONResponse({"ok": True})
 
 
@@ -411,7 +516,10 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
         ]})
 
     # 注册在动态名称路由之前；测试连接不修改连接池或持久化配置。
-    @route("/api/instances/test", ["POST"], action="instance.test", object_type="instance")
+    @route(
+        "/api/instances/test", ["POST"], action="instance.test", object_type="instance",
+        audit_mode=PersonAuditMode.LIFECYCLE,
+    )
     async def test_instance(request):
         value = await read_body(request)
         name = str(value.get("name") or "").strip()
@@ -446,7 +554,10 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
                 await state.pool.close_one_shot(conn)
         return JSONResponse({"ok": True, "message": "连接成功"})
 
-    @route("/api/instances", ["POST"], action="instance.create", object_type="instance")
+    @route(
+        "/api/instances", ["POST"], action="instance.create", object_type="instance",
+        audit_mode=PersonAuditMode.LIFECYCLE,
+    )
     async def create_instance(request):
         body = await read_body(request)
         name = str(body.get("name") or "").strip()
@@ -454,10 +565,13 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
             raise IdentityError("缺少实例名 name")
         request.state.identity_event["object_id"] = name
         request.state.identity_event["summary"] = "创建数据库实例（凭据不记录）"
-        config = await state.upsert_instance(name, body, create_only=True)
+        config = await state.upsert_instance(name, body, create_only=True, event=request.state.identity_event)
         return JSONResponse(_instance_payload(name, config.get_instance(name)), status_code=201)
 
-    @route("/api/instances/{name}", ["PUT"], action="instance.update", object_type="instance")
+    @route(
+        "/api/instances/{name}", ["PUT"], action="instance.update", object_type="instance",
+        audit_mode=PersonAuditMode.LIFECYCLE,
+    )
     async def update_instance(request):
         name = request.path_params["name"]
         if state.config.get_instance(name) is None:
@@ -466,10 +580,13 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
         request.state.identity_event["summary"] = "更新数据库实例" + (
             "，密码已更换" if body.get("password") else "，保留原凭据"
         )
-        config = await state.upsert_instance(name, body)
+        config = await state.upsert_instance(name, body, event=request.state.identity_event)
         return JSONResponse(_instance_payload(name, config.get_instance(name)))
 
-    @route("/api/instances/{name}", ["DELETE"], action="instance.delete", object_type="instance")
+    @route(
+        "/api/instances/{name}", ["DELETE"], action="instance.delete", object_type="instance",
+        audit_mode=PersonAuditMode.LIFECYCLE,
+    )
     async def delete_instance(request):
         name = request.path_params["name"]
         if state.config.get_instance(name) is None:
@@ -477,7 +594,10 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
         await state.delete_instance(name)
         return JSONResponse({"ok": True})
 
-    @route("/api/config-raw", ["GET"], action="config.export", object_type="config")
+    @route(
+        "/api/config-raw", ["GET"], action="config.export", object_type="config",
+        audit_mode=PersonAuditMode.LIFECYCLE,
+    )
     async def config_raw(request):
         # 只导出脱敏副本，旧 auth.users 中的 token 也不能重新暴露。
         from copy import deepcopy
@@ -508,7 +628,10 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
         )
         return JSONResponse({"records": records, "total": total, "limit": limit, "offset": offset})
 
-    @route("/api/audit/export", ["GET"], action="audit.export", object_type="audit")
+    @route(
+        "/api/audit/export", ["GET"], action="audit.export", object_type="audit",
+        audit_mode=PersonAuditMode.LIFECYCLE,
+    )
     async def audit_export(request):
         filters = _audit_filters(request.query_params)
         rows = await asyncio.to_thread(state.audit.export_rows, **filters)
@@ -534,6 +657,8 @@ def register_web_routes(mcp: FastMCP, state: DbState) -> None:
                 "token_id",
                 "token_name",
                 "token_prefix",
+                "workspace_id",
+                "workspace_name",
                 "tool",
                 "kind",
                 "user",

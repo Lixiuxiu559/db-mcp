@@ -63,25 +63,14 @@ class ListenerConfig(BaseModel):
     port: int = 8807
 
 
-class UserEntry(BaseModel):
-    username: str
-    token: SecretStr
-    admin: bool = False
-
-
 class AuthConfig(BaseModel):
-    # users 仅用于旧 MCP token 的一次性迁移，不再是网页人员账号。
-    users: list[UserEntry] = Field(default_factory=list)
     database: Path = Path("data/service.db")
     session_hours: int = Field(default=8, ge=1, le=168)
     cookie_secure: bool = False
     cookie_path: str = "/"
 
     @model_validator(mode="after")
-    def _ensure_users(self) -> AuthConfig:
-        names = [u.username for u in self.users]
-        if len(names) != len(set(names)):
-            raise ValueError("auth.users 中存在重复的 username")
+    def _check_cookie_path(self) -> AuthConfig:
         if not self.cookie_path.startswith("/") or not self.cookie_path.endswith("/"):
             raise ValueError("auth.cookie_path 必须以 / 开始和结束")
         return self
@@ -109,7 +98,15 @@ class LimitsConfig(BaseModel):
 _Permissions = Literal["read", "write"]
 
 
-class PostgresInstance(BaseModel):
+class AssignedInstance(BaseModel):
+    workspace_ids: list[str] = Field(default_factory=list, strict=True)
+
+    def connection_signature(self) -> dict[str, Any]:
+        """归属更新独立于远端登录身份、目标与读写策略。"""
+        return self.model_dump(exclude={"workspace_ids"})
+
+
+class PostgresInstance(AssignedInstance):
     type: Literal["postgres"] = "postgres"
     host: str
     port: int = 5432
@@ -123,7 +120,7 @@ class PostgresInstance(BaseModel):
     model_config = {"populate_by_name": True}
 
 
-class RedisInstance(BaseModel):
+class RedisInstance(AssignedInstance):
     type: Literal["redis"] = "redis"
     host: str
     port: int = 6379
@@ -160,13 +157,18 @@ class GatewayConfig(BaseModel):
     def get_instance(self, name: str) -> InstanceConfig | None:
         return self.instances.get(name)
 
-    def resolve_instance(self, name: str) -> InstanceConfig:
+    def visible_instances(self, workspace_id: str) -> dict[str, InstanceConfig]:
+        return {
+            name: inst for name, inst in self.instances.items() if workspace_id in inst.workspace_ids
+        }
+
+    def resolve_instance(self, name: str, workspace_id: str) -> InstanceConfig:
         """取实例并校验启用状态；不存在/已禁用给出可读错误。"""
         from .errors import InstanceDisabledError, InstanceNotFoundError
 
         entry = self.instances.get(name)
-        if entry is None:
-            raise InstanceNotFoundError(name, sorted(self.instances))
+        if entry is None or workspace_id not in entry.workspace_ids:
+            raise InstanceNotFoundError(name, sorted(self.visible_instances(workspace_id)))
         if not entry.enabled:
             raise InstanceDisabledError(name)
         return entry
@@ -175,7 +177,6 @@ class GatewayConfig(BaseModel):
         """掩码密码的配置摘要，用于调试输出。"""
         lines = [
             f"监听 {self.server.host}:{self.server.port}",
-            f"旧 MCP 凭证 {len(self.auth.users)} 个（仅用于首次迁移）",
             f"审计日志 {self.audit.path}",
         ]
         for name, inst in self.instances.items():
@@ -199,6 +200,7 @@ _INSTANCE_KEYS = (
     "permissions",
     "schema",
     "enabled",
+    "workspace_ids",
 )
 
 
@@ -224,7 +226,10 @@ class ConfigFile:
 
     def load(self) -> GatewayConfig:
         try:
-            config = GatewayConfig.model_validate(expand_env_vars(deepcopy(self.raw)))
+            data = deepcopy(self.raw)
+            if isinstance(data.get("auth"), dict):
+                data["auth"].pop("users", None)
+            config = GatewayConfig.model_validate(expand_env_vars(data))
             base = self.path.resolve().parent
             if not config.auth.database.is_absolute():
                 config.auth.database = base / config.auth.database
@@ -257,6 +262,8 @@ class ConfigFile:
         snapshot = deepcopy(instances)
         try:
             existing = instances.get(name)
+            if existing is not None and "workspace_ids" not in entry:
+                entry["workspace_ids"] = existing.get("workspace_ids", [])
             if existing is not None and not entry.get("password"):
                 # 编辑时未填密码：保留原密码（含 ${ENV} 引用）
                 entry = {**entry, "password": existing.get("password", "")}

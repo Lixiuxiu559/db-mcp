@@ -1,8 +1,9 @@
-export type { User, Session, TokenEntry } from "./console-types";
+export type { User, Session, TokenEntry, WorkspaceEntry } from "./console-types";
 
 export interface InstanceEntry {
   name: string;
   type: "postgres" | "redis";
+  workspace_ids: string[];
   host: string;
   port: number;
   database: string | number;
@@ -20,6 +21,8 @@ export interface AuditRecord {
   status: string;
   token_id?: string | null;
   token_name?: string | null;
+  workspace_id?: string | null;
+  workspace_name?: string | null;
   token_prefix?: string | null;
   tool?: string | null;
   instance?: string | null;
@@ -51,5 +54,6 @@ export type Page =
   | "instances"
   | "users"
   | "tokens"
+  | "workspaces"
   | "mcp-audit"
   | "person-audit";

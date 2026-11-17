@@ -46,14 +46,13 @@ def test_invalid_instance_name_rejected(make_mcp):
         make_mcp("\n  bad name!:\n    type: redis\n    host: h\n    permissions: read\n")
 
 
-def test_resolve_instance_raises_readable_errors(make_mcp):
-    gw = make_mcp()
+def test_resolve_instance_raises_readable_errors(gw):
     from db_mcp.errors import InstanceDisabledError, InstanceNotFoundError
 
     with pytest.raises(InstanceNotFoundError, match="可用实例"):
-        gw.state.config.resolve_instance("nope")
+        gw.state.config.resolve_instance("nope", gw.workspace_id)
     with pytest.raises(InstanceDisabledError, match="已禁用"):
-        gw.state.config.resolve_instance("pg-disabled")
+        gw.state.config.resolve_instance("pg-disabled", gw.workspace_id)
 
 
 async def test_upsert_new_instance_persists(make_mcp):
@@ -135,7 +134,7 @@ def test_runtime_paths_are_relative_to_config_directory(tmp_path, monkeypatch):
     assert cfg.audit.path == config_dir / "audit" / "audit.db"
     assert cfg.server.host == "127.0.0.1"
     assert cfg.server.port == 8807
-    assert cfg.auth.users == []
+    assert "users" not in cfg.auth.model_dump()
 
 
 def test_auth_settings_validation():
@@ -159,7 +158,7 @@ def test_cli_initializes_private_empty_config_without_overwrite(tmp_path, monkey
     main()
     assert st.S_IMODE(path.stat().st_mode) == 0o600
     config = ConfigFile(path).load()
-    assert config.instances == {} and config.auth.users == []
+    assert config.instances == {} and "users" not in config.auth.model_dump()
     assert config.server.port == 8807
     original = path.read_bytes()
     with pytest.raises(SystemExit) as exc:
@@ -192,7 +191,7 @@ async def test_failed_config_save_preserves_memory_and_disk(make_mcp, monkeypatc
     assert gw.config_path.read_bytes() == original_bytes
 
 
-async def test_changing_working_directory_preserves_identity_and_legacy_token(
+async def test_changing_working_directory_preserves_scoped_token_without_importing_static_credentials(
     tmp_path, monkeypatch
 ):
     from db_mcp.config import ConfigFile
@@ -205,18 +204,19 @@ async def test_changing_working_directory_preserves_identity_and_legacy_token(
         "auth:\n  users:\n    - username: old-client\n      token: stable-legacy-token\ninstances: {}\n"
     )
     _, first = create_mcp(ConfigFile(path))
-    token = first.identity.verify_token("stable-legacy-token")
-    assert token is not None
+    assert first.identity.verify_token("stable-legacy-token") is None
+    workspace = first.identity.save_workspace("test")
+    secret, token = first.identity.create_token("issued", "creator", workspace["id"])
     await first.shutdown()
     other = tmp_path / "another-cwd"
     other.mkdir()
     monkeypatch.chdir(other)
     _, second = create_mcp(ConfigFile(path))
     assert second.identity.path == configured / "data" / "service.db"
-    assert second.identity.verify_token("stable-legacy-token")["id"] == token["id"]
+    assert second.identity.verify_token(secret)["id"] == token["id"]
     second.identity.revoke_token(token["id"])
     await second.shutdown()
     _, third = create_mcp(ConfigFile(path))
-    assert third.identity.verify_token("stable-legacy-token") is None
+    assert third.identity.verify_token(secret) is None
     assert len(third.identity.list_tokens()) == 1
     await third.shutdown()

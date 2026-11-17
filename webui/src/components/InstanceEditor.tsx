@@ -15,6 +15,8 @@ import {
 import { Cable, Save } from "lucide-react";
 import type { InstanceEntry } from "../types";
 import { api, json } from "../api";
+import { useWorkspaces } from "../lib/use-workspaces";
+import { WorkspaceSelectField } from "./WorkspaceAccess";
 import { errorText } from "../lib/utils";
 import { AppModal } from "./AppModal";
 import { Feedback } from "./Feedback";
@@ -22,6 +24,7 @@ import { Feedback } from "./Feedback";
 interface InstanceValues {
   name: string;
   type: InstanceEntry["type"];
+  workspace_ids: string[];
   host: string;
   port: number;
   database: string | number;
@@ -36,12 +39,15 @@ export function InstanceEditor({
   editing,
   onClose,
   onSaved,
+  onManageWorkspaces,
 }: {
   editing: InstanceEntry | null;
   onClose: () => void;
   onSaved: () => void;
+  onManageWorkspaces?: () => void;
 }) {
   const [form] = Form.useForm<InstanceValues>();
+  const workspaceResource = useWorkspaces();
   const formId = useId();
   const type = Form.useWatch("type", form) || editing?.type || "postgres";
   const permissions = Form.useWatch("permissions", form) || editing?.permissions || "read";
@@ -53,6 +59,7 @@ export function InstanceEditor({
     return {
       name: values.name.trim(),
       type: values.type,
+      workspace_ids: values.workspace_ids || [],
       host: values.host.trim(),
       port: values.port,
       database:
@@ -163,6 +170,7 @@ export function InstanceEditor({
         initialValues={{
           name: editing?.name || "",
           type: editing?.type || "postgres",
+          workspace_ids: editing?.workspace_ids || [],
           host: editing?.host || "",
           port: editing?.port || 5432,
           database: editing?.database ?? "",
@@ -277,6 +285,7 @@ export function InstanceEditor({
           </Col>
         </Row>
         <Typography.Title level={3}>访问边界</Typography.Title>
+        <WorkspaceSelectField multiple disabled={!!busy} workspaces={workspaceResource.data.workspaces} loading={workspaceResource.loading} error={workspaceResource.error} onRetry={workspaceResource.reload} onManage={onManageWorkspaces} />
         <Form.Item name="permissions" label="工具读写权限">
           <Select options={[
             { value: "read", label: "只读 · read — 允许读取，拒绝写入" },

@@ -12,8 +12,10 @@ from mcp.shared.exceptions import MCPError
 @pytest.fixture
 def app(gw):
     identity = gw.state.identity
-    identity.initialize("alice", "password-alice", identity.setup_key_path.read_text().strip())
+    default_user = identity.list_users()[0]
+    identity.create_user("alice", "password-alice")
     identity.create_user("bob", "password-bob")
+    identity.delete_user(default_user["id"])
     return gw.mcp.http_app()
 
 
@@ -163,12 +165,12 @@ async def test_unknown_route_returns_404(app):
     assert resp.status_code == 404
 
 
-async def test_config_hot_reload_visible_to_tools(app, gw):
+async def test_config_hot_reload_visible_to_tools(app, gw, inprocess_auth):
     async with Client(gw.mcp) as client:
         before = await client.call_tool("list_instances", {})
         assert len(before.data.instances) == 5
 
-        resp = await request(app, "POST", "/api/instances", token="tok-alice", json=_NEW_PG)
+        resp = await request(app, "POST", "/api/instances", token="tok-alice", json={**_NEW_PG, "workspace_ids": [gw.workspace_id]})
         assert resp.status_code == 201
 
         after = await client.call_tool("list_instances", {})
@@ -239,7 +241,7 @@ async def test_users_and_tokens_managed_separately(app, gw):
     assert "tok-alice" not in people.text
     created = await request(app, "POST", "/api/users", token="tok-bob", json={"username": "charlie", "password": "password-charlie"})
     assert created.status_code == 201
-    token = await request(app, "POST", "/api/tokens", token="tok-bob", json={"name": "ci-agent", "description": "自动化"})
+    token = await request(app, "POST", "/api/tokens", token="tok-bob", json={"name": "ci-agent", "workspace_id": gw.workspace_id, "description": "自动化"})
     assert token.status_code == 201
     secret = token.json()["token"]
     token_id = token.json()["item"]["id"]
@@ -264,7 +266,7 @@ async def test_delete_member_requires_csrf_revokes_sessions_and_preserves_tokens
     users = {user["username"]: user for user in gw.state.identity.list_users()}
     alice_id, bob_id = users["alice"]["id"], users["bob"]["id"]
     _, bob_session, _ = gw.state.identity.login("bob", "password-bob")
-    secret, token = gw.state.identity.create_token("bob-client", bob_id)
+    secret, token = gw.state.identity.create_token("bob-client", bob_id, gw.workspace_id)
     await gw.state.audit.log_person({
         "action": "user.login", "actor_user_id": bob_id, "username": "bob", "status": "ok"
     })
@@ -317,7 +319,7 @@ async def test_last_enabled_member_cannot_be_deleted_when_disabled_member_exists
 
 
 async def test_token_delete_is_final_idempotent_and_preserves_audit_history(app, gw):
-    created = await request(app, "POST", "/api/tokens", token="tok-alice", json={"name": "delete-me"})
+    created = await request(app, "POST", "/api/tokens", token="tok-alice", json={"name": "delete-me", "workspace_id": gw.workspace_id})
     secret, item = created.json()["token"], created.json()["item"]
     await gw.state.audit.log({
         "token_id": item["id"], "token_name": item["name"], "tool": "postgres_query",
@@ -345,7 +347,7 @@ async def test_token_delete_is_final_idempotent_and_preserves_audit_history(app,
 
 
 async def test_management_token_list_hides_previously_revoked_tokens(app, gw):
-    item = gw.state.identity.verify_token("tok-bob")
+    _, item = gw.state.identity.create_token("revoked", "creator", gw.workspace_id)
     gw.state.identity.revoke_token(item["id"])
     listed = (await request(app, "GET", "/api/tokens", token="tok-alice")).json()["tokens"]
     assert listed and all(not row["revoked"] for row in listed)
@@ -363,7 +365,7 @@ async def test_session_revoked_when_password_changes(app):
         assert (await client.post("/api/auth/login", json={"username": "bob", "password": "new-password-bob"})).status_code == 200
 
 
-async def test_setup_requires_local_code_no_default_account(tmp_path, harness):
+async def test_first_startup_creates_default_account(tmp_path, harness):
     from db_mcp.config import ConfigFile
     from db_mcp.server import create_mcp
 
@@ -372,14 +374,14 @@ async def test_setup_requires_local_code_no_default_account(tmp_path, harness):
     mcp, state = create_mcp(ConfigFile(path))
     app = mcp.http_app()
     try:
-        assert (await request(app, "GET", "/api/auth/status")).json()["setup_required"]
+        assert not (await request(app, "GET", "/api/auth/status")).json()["setup_required"]
         assert state.identity.verify_token("admin") is None
         bad = await request(app, "POST", "/api/auth/setup", json={"username": "owner", "password": "owner-password", "setup_key": "wrong"})
         assert bad.status_code == 400
-        setup = await request(app, "POST", "/api/auth/setup", json={"username": "owner", "password": "owner-password", "setup_key": state.identity.setup_key_path.read_text().strip()})
-        assert setup.status_code == 201
-        assert not (await request(app, "GET", "/api/auth/status")).json()["setup_required"]
-        assert "password" not in setup.json()["user"]
+        login = await request(app, "POST", "/api/auth/login", json={"username": "admin", "password": "admin"})
+        assert login.status_code == 200
+        assert not state.identity.setup_key_path.exists()
+        assert "password" not in login.json()["user"]
     finally:
         await state.shutdown()
 
@@ -414,7 +416,7 @@ async def test_invalid_json_and_validation_do_not_expose_secrets(app):
 async def test_existing_mcp_session_rechecks_revoked_token(app, gw):
     from fastmcp.client.transports import StreamableHttpTransport
 
-    token = await request(app, "POST", "/api/tokens", token="tok-alice", json={"name": "mcp-session"})
+    token = await request(app, "POST", "/api/tokens", token="tok-alice", json={"name": "mcp-session", "workspace_id": gw.workspace_id})
     secret = token.json()["token"]
     token_id = token.json()["item"]["id"]
     def factory(**kwargs):

@@ -9,12 +9,12 @@ import pytest
 
 from db_mcp.auth import IdentityError, IdentityStore
 from db_mcp.auth.verifier import StoreTokenVerifier
-from db_mcp.config import UserEntry
 
 
 def setup_store(tmp_path):
     store = IdentityStore(tmp_path / "data" / "service.db")
     user = store.initialize("ops", "correct-password", store.setup_key_path.read_text())
+    store.save_workspace("test")
     return store, user
 
 
@@ -35,7 +35,7 @@ def test_setup_requires_local_key_and_never_default_admin(tmp_path):
 
 def test_password_hash_session_and_token_are_separate(tmp_path):
     store, user = setup_store(tmp_path)
-    value, item = store.create_token("codex", user["id"])
+    value, item = store.create_token("codex", user["id"], store.list_workspaces()[0]["id"])
     logged, session, csrf = store.login("ops", "correct-password")
     assert logged["id"] == user["id"] and len(csrf) > 30
     assert store.session(session)[0]["id"] == user["id"]
@@ -59,7 +59,7 @@ def test_users_same_capabilities_last_user_and_sessions(tmp_path):
     store.update_user(second["id"], {"password": "replacement-password"})
     assert store.session(session) is None
     _, session, _ = store.login("second", "replacement-password")
-    value, _ = store.create_token("machine", second["id"])
+    value, _ = store.create_token("machine", second["id"], store.list_workspaces()[0]["id"])
     store.update_user(second["id"], {"enabled": False})
     assert store.session(session) is None
     assert store.verify_token(value) is not None  # independent lifecycle
@@ -74,7 +74,7 @@ def test_delete_user_revokes_all_sessions_and_preserves_independent_tokens(tmp_p
     _, session, _ = store.login("second", "second-password")
     _, other_session, _ = store.login("second", "second-password")
     _, first_session, _ = store.login("ops", "correct-password")
-    value, token = store.create_token("machine", second["id"])
+    value, token = store.create_token("machine", second["id"], store.list_workspaces()[0]["id"])
     event = {"action": "user.delete", "actor_user_id": first["id"]}
 
     store.delete_user(second["id"], event)
@@ -164,36 +164,29 @@ def test_concurrent_user_mutation_keeps_one_enabled_account(tmp_path, second_act
     assert sum(row["enabled"] for row in store.list_users()) == 1
 
 
-async def test_legacy_tokens_import_once_and_survive_restart(tmp_path):
+async def test_unbound_credentials_remain_unusable_after_reopen(tmp_path):
+    from hashlib import sha256
+
     path = tmp_path / "service.db"
-    users = [
-        UserEntry(username="legacy", token="original-token"),
-        UserEntry(username="admin", token="admin", admin=True),
-    ]
+    with sqlite3.connect(path) as conn:
+        conn.execute("""CREATE TABLE tokens (
+            id TEXT PRIMARY KEY, name TEXT, description TEXT, prefix TEXT, token_hash TEXT,
+            enabled INTEGER, revoked INTEGER, created_by TEXT, created_at TEXT,
+            last_used_at TEXT, legacy INTEGER DEFAULT 0
+        )""")
+        conn.execute("INSERT INTO tokens VALUES('old','old','','old',?,1,0,NULL,'',NULL,0)",
+                     (sha256(b"old-secret").hexdigest(),))
     store = IdentityStore(path)
-    store.migrate_legacy(users)
-    item = store.verify_token("original-token")
-    assert item["legacy"] and store.verify_token("admin") is not None
-    verifier = StoreTokenVerifier(store)
-    access = await verifier.verify_token("original-token")
-    assert access.client_id == item["id"]
-    assert access.claims["token_name"] == "legacy:legacy"
+    assert store.list_workspaces() == []
+    assert store.token_info("old")["workspace_id"] is None
+    assert await StoreTokenVerifier(store).verify_token("old-secret") is None
     store.close()
-    reopened = IdentityStore(path)
-    reopened.migrate_legacy(users)
-    assert reopened.verify_token("original-token")["id"] == item["id"]
-    reopened.revoke_token(item["id"])
-    reopened.close()
-    reopened = IdentityStore(path)
-    reopened.migrate_legacy(users)
-    assert reopened.verify_token("original-token") is None
-    assert len(reopened.list_tokens()) == 2
 
 
 def test_new_old_tokens_parallel_and_revocation_is_final(tmp_path):
     store, user = setup_store(tmp_path)
-    old, first = store.create_token("old", user["id"])
-    new, second = store.create_token("new", user["id"])
+    old, first = store.create_token("old", user["id"], store.list_workspaces()[0]["id"])
+    new, second = store.create_token("new", user["id"], store.list_workspaces()[0]["id"])
     assert store.verify_token(old) and store.verify_token(new)
     store.update_token(first["id"], {"enabled": False})
     assert store.verify_token(old) is None
@@ -207,8 +200,8 @@ def test_new_old_tokens_parallel_and_revocation_is_final(tmp_path):
 
 def test_delete_token_hides_metadata_and_cannot_be_reimported(tmp_path):
     store, user = setup_store(tmp_path)
-    value, item = store.create_token("machine", user["id"])
-    retained, other = store.create_token("other", user["id"])
+    value, item = store.create_token("machine", user["id"], store.list_workspaces()[0]["id"])
+    retained, other = store.create_token("other", user["id"], store.list_workspaces()[0]["id"])
     event = {"event_id": "delete-1", "action": "token.delete", "actor_user_id": user["id"]}
     store.delete_token(item["id"], event)
     assert store.verify_token(value) is None
@@ -221,7 +214,6 @@ def test_delete_token_hides_metadata_and_cannot_be_reimported(tmp_path):
     store.close()
 
     reopened = IdentityStore(store.path)
-    reopened.migrate_legacy([UserEntry(username="old-config", token=value)])
     assert reopened.verify_token(value) is None
     assert reopened.verify_token(retained)["id"] == other["id"]
     assert [row["id"] for row in reopened.list_tokens(include_deleted=False)] == [other["id"]]
@@ -232,7 +224,7 @@ def test_delete_token_hides_metadata_and_cannot_be_reimported(tmp_path):
 
 def test_delete_token_rolls_back_if_audit_outbox_fails(tmp_path, monkeypatch):
     store, user = setup_store(tmp_path)
-    value, item = store.create_token("machine", user["id"])
+    value, item = store.create_token("machine", user["id"], store.list_workspaces()[0]["id"])
     original = store._event
 
     def fail(conn, record, **kwargs):
@@ -255,7 +247,7 @@ def test_delete_token_rolls_back_if_audit_outbox_fails(tmp_path, monkeypatch):
 def test_identity_mutation_and_audit_outbox_are_atomic(tmp_path, monkeypatch):
     store, user = setup_store(tmp_path)
     event = {"event_id": "evt-1", "action": "token.create", "actor_user_id": user["id"]}
-    value, item = store.create_token("machine", user["id"], event=event)
+    value, item = store.create_token("machine", user["id"], store.list_workspaces()[0]["id"], event=event)
     records = store.pending_events()
     assert len(records) == 1 and records[0][1]["object_id"] == item["id"]
     original = store._event
@@ -265,7 +257,7 @@ def test_identity_mutation_and_audit_outbox_are_atomic(tmp_path, monkeypatch):
 
     monkeypatch.setattr(store, "_event", fail)
     with pytest.raises(sqlite3.OperationalError):
-        store.create_token("must-rollback", user["id"], event={"action": "token.create"})
+        store.create_token("must-rollback", user["id"], store.list_workspaces()[0]["id"], event={"action": "token.create"})
     assert len(store.list_tokens()) == 1
     monkeypatch.setattr(store, "_event", original)
     store.acknowledge_event(records[0][0])
@@ -309,7 +301,7 @@ async def test_rejected_mcp_auth_is_audited_without_received_credential(tmp_path
     store, user = setup_store(tmp_path)
     audit = AuditLogger(tmp_path / "audit.db")
     verifier = StoreTokenVerifier(store, audit)
-    value, token = store.create_token("machine", user["id"])
+    value, token = store.create_token("machine", user["id"], store.list_workspaces()[0]["id"])
     assert await verifier.verify_token(value) is not None
     used = store.token_info(token["id"])["last_used_at"]
     store.update_token(token["id"], {"enabled": False})
