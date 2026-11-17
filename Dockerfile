@@ -42,4 +42,4 @@ EXPOSE 8807
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD ["/app/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8807/healthz').read()"]
 
-CMD ["db-mcp", "--config", "/data/config.yaml", "--host", "0.0.0.0"]
+CMD ["db-mcp", "--init-if-missing", "--config", "/data/config.yaml", "--host", "0.0.0.0"]
