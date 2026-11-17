@@ -4,38 +4,109 @@
 
 **让 AI 连接数据库，也让每次数据操作有迹可循。**
 
-[![Docker Hub](https://img.shields.io/badge/Docker_Hub-2.1.0-146ED0?logo=docker&logoColor=white)](https://hub.docker.com/r/lijx559/db-mcp)
+[![Docker Hub](https://img.shields.io/badge/Docker_Hub-published_2.1.0-146ED0?logo=docker&logoColor=white)](https://hub.docker.com/r/lijx559/db-mcp)
 [![Platforms](https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-4B5FC4)](docs/releases/2026-10-30-dockerhub.md)
 [![FastMCP](https://img.shields.io/badge/FastMCP-4.1.4-17242B)](https://gofastmcp.com)
 
 **简体中文** · [English](README.en.md)
 
-[产品能力](#features) · [Docker Compose 部署](#deploy) · [MCP 接入](#connect) · [运维](#operations)
+[产品能力](#features) · [快速开始](#quickstart) · [Docker 部署](#deploy) · [MCP 接入](#connect) · [运维](#operations)
 
 </div>
 
-面向 PostgreSQL 与 Redis 的自托管 MCP 网关。集中管理连接与凭据，按实例控制只读/读写边界，通过一个工作台查看配置操作和数据库调用。
+面向 PostgreSQL 与 Redis 的自托管 MCP 网关。集中管理数据库连接，按工作空间隔离客户端访问，保留实例读写防护，并在同一个后台追踪人员操作与数据库调用。
 
-![DB MCP 工作台演示](docs/images/workspace.png)
+> 本文功能与截图对应当前 **`dev` 分支**。首次启动默认账号为 **`admin / admin`**。Docker Hub 的 `2.1.0` 是既有发布版本；本次工作空间、Token 与界面改动需从 `dev` 源码运行或自行构建，尚未发布为新镜像。
 
-<sub>截图来自独立演示环境，不包含真实生产资源或凭据。</sub>
+![DB MCP 实例管理：工作空间归属、目标端点与读写权限](docs/images/workspace.png)
+
+<sub>2026-11-17 从当前构建拍摄；资源、成员与审计记录均为隔离演示数据，不含真实业务或凭据。</sub>
 
 <a id="features"></a>
 
 ## 产品能力
 
-| 能力 | 你可以做什么 |
+| 能力 | 当前功能 |
 |---|---|
-| 多实例管理 | 统一维护 PostgreSQL、Redis 连接，支持连通性测试与配置热更新。 |
-| 数据操作 | 31 个 MCP 工具覆盖 SQL 查询、表结构浏览及 Redis 常用数据类型。 |
-| 读写边界 | 实例默认只读；PostgreSQL 叠加工具权限、SQL 静态分析与只读事务。 |
-| 危险操作确认 | 高危 DDL 需要 `confirm=true`，保留显式确认入口。 |
-| 独立凭证与双审计 | 人员登录与 MCP token 分离；追踪实际数据库目标，默认保留 30 天。 |
-| 统一工作台 | Ant Design 6、OPPO Sans、浅色/深色主题、可折叠侧栏与统一表格分页。 |
+| 资源管理 | 管理 PostgreSQL / Redis 连接，支持手动测试与配置热更新。 |
+| 工作空间授权 | 一份资源可归属多个项目；每枚 MCP Token 固定属于一个工作空间，只能发现和操作当前归属资源。 |
+| MCP 工具 | 31 个工具：2 个实例工具、6 个 PostgreSQL 工具、23 个 Redis 工具。 |
+| 数据库防护 | 实例默认只读；SQL 静态分析与只读事务叠加保护，高危 DDL 需要显式确认。 |
+| Token 生命周期 | 独立创建、启停、确认删除；新 Token 支持列表复制及 Claude Code JSON / Codex TOML 接入示例。 |
+| Token 到期 | 默认长期有效，可设置、调整或清除到期时间；到期后拒绝后续调用，保留身份和历史。 |
+| 成员与会话 | 默认 admin/admin，普通密码 6–1024 字符；人员同权，保护最后一个启用成员，密码变更及停用/删除撤销会话。 |
+| 双审计 | 分别查询人员操作与 MCP 调用，按凭证、工作空间和实际目标追溯，支持详情、筛选与 CSV 导出，默认保留 30 天。 |
+| 桌面控制台 | Ant Design 6、OPPO Sans 4.0、浅/深主题、可折叠侧栏与统一分页。 |
+
+<details>
+<summary>Token 复制、启停与到期状态</summary>
+
+![DB MCP · Token 复制、启停与到期状态](docs/images/tokens.png)
+
+</details>
+
+<details>
+<summary>MCP 调用审计与深色主题</summary>
+
+![DB MCP · MCP 调用审计与深色主题](docs/images/audit.png)
+
+</details>
+
+<a id="quickstart"></a>
+
+## 快速开始：当前 dev 源码
+
+需要 Python 3.10+ 和 uv。仓库已包含管理页面构建产物，启动服务无需 Node.js。
+
+```bash
+git clone --branch dev https://github.com/Lixiuxiu559/db-mcp.git
+cd db-mcp
+uv sync --locked
+uv run --locked db-mcp --init --config ./runtime/config.yaml
+uv run --locked db-mcp --config ./runtime/config.yaml
+```
+
+CLI 支持 `--host`、`--port`、`--config` 与 `--data-dir`。`--data-dir` 相对启动目录解析，只覆盖数据路径，不自动移动已有数据。
+
+打开 **http://127.0.0.1:8807/**，按以下顺序完成接入：
+
+1. 用 **`admin / admin`** 登录，可在账号菜单修改密码。普通新建、修改和重置密码要求 **6–1024 个字符**，安装默认密码是唯一例外。
+2. 在「工作空间」创建项目。
+3. 在「实例管理」添加资源并选择一个或多个所属工作空间。为每个实例选择只读或读写权限，数据库账号原有权限继续生效。
+4. 在「MCP Token」为客户端创建凭证，单选一个工作空间；到期时间留空即长期有效。
+5. 从列表复制 Token 或打开「接入」，选择 Claude Code / Codex 配置，再用客户端列出可访问资源。
+
+首次启动只在身份库没有任何用户时创建默认账号。已有用户时不补建、不重置；常规重启与升级保留账号、工作空间、有效 Token 和设置的期限。未归属工作空间的资源不向 MCP 客户端开放。
+
+### 用当前源码构建 Docker
+
+在上面的源码目录中执行。以下使用独立的本地镜像名，`runtime/` 保存全部运行数据：
+
+```bash
+mkdir -p runtime
+umask 077
+cat > .env <<EOF
+COMPOSE_PROJECT_NAME=db-mcp
+DOCKER_UID=$(id -u)
+DOCKER_GID=$(id -g)
+DBMCP_IMAGE=db-mcp:dev
+DBMCP_BIND_ADDRESS=127.0.0.1
+DBMCP_PORT=8807
+TZ=Asia/Shanghai
+EOF
+docker compose -f docker-compose.yml -f docker-compose.build.yml build
+docker compose -f docker-compose.yml -f docker-compose.build.yml run --rm db-mcp db-mcp --init --config /data/config.yaml
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+curl -fsS http://127.0.0.1:8807/healthz
+```
+
+`--init` 不覆盖已有配置；已有运行目录跳过该步。源码进程和容器使用相同端口，运行前先停止另一种启动方式。以 root 部署时，为 `.env` 指定专用非 root UID/GID，并让它拥有 `runtime/` 的读写权限。
 
 <a id="deploy"></a>
 
-## Docker Compose 部署
+## Docker Compose 部署：既有发布镜像
+
+以下无需克隆源码，使用既有 `2.1.0` 镜像。该版本的界面、账号初始化与 Token 能力以[发布记录](docs/releases/2026-10-30-dockerhub.md)和实际镜像为准；体验本文当前功能请使用上面的 `dev` 源码或源码构建镜像。
 
 需要 Docker Engine（或 Docker Desktop）与 Docker Compose v2。无需克隆源码，镜像已包含完整管理页面。部署机器需要能访问目标数据库。
 
@@ -94,19 +165,9 @@ curl -fsS http://127.0.0.1:8807/healthz
 
 `--init` 仅首次创建空配置，不覆盖已有文件；已有部署升级时跳过初始化命令。健康接口返回 `{"ok":true}` 后，打开 **http://127.0.0.1:8807/**。
 
-### 4. 使用安装默认账号登录
+### 4. 完成镜像对应的账号初始化
 
-当前源码及据此构建的镜像，首次安装启动且身份库没有用户时，自动创建默认登录账号 **`admin`**、密码 **`admin`**，无需读取初始化码。源码、Docker/Compose、安装包与 uvx 共用此规则；上文版本化镜像需后续发布后包含该改动。
-
-登录后可在账号菜单修改密码。普通新建、修改和重置密码要求 **6–1024 个字符**；安装默认密码为唯一长度例外。已有用户时不会补建默认账号或重置密码，常规重启、升级保留原有账号、密码及有效 MCP token。
-
-在「实例管理」中添加 PostgreSQL 或 Redis，选择只读/读写并测试连接；再到「MCP Token」创建客户端专用 token。容器需要能直连目标数据库，数据库原有账号权限仍然生效。
-
-### 当前源码的工作空间配置
-
-工作空间功能已接入当前源码和本地前端产物。使用本功能请从当前源码启动，或自行构建对应镜像。上文快速部署引用的版本化镜像，需要后续发布才会包含本次改动。
-
-先在「工作空间」创建项目，再添加数据库实例并多选所属工作空间。在「MCP Token」创建客户端凭证时必须选择一个工作空间，客户端只可列出和操作该空间的资源。数据库仍需选择只读/读写权限，容器需能直连目标数据库，数据库账号权限继续生效。
+按该固定版本管理页和启动日志的提示完成首次账号设置。本文前面的 `admin / admin` 安装默认规则对应当前 `dev` 实现，不代表既有镜像已更新。随后在后台配置资源并创建客户端专用 MCP Token。
 
 ### Compose 配置说明
 
@@ -129,7 +190,7 @@ curl -fsS http://127.0.0.1:8807/healthz
 
 ## MCP 接入
 
-在工作台创建并保存 MCP token，然后为支持 HTTP 的客户端添加配置：
+先在工作台为目标工作空间创建 MCP Token。可从列表重复复制，或打开「接入」直接复制 Claude Code JSON / Codex TOML；以下是同机接入示例：
 
 Claude Code 在项目目录的 `.mcp.json` 中配置。
 
@@ -164,17 +225,16 @@ http_headers = { Authorization = "Bearer <MCP_TOKEN>" }
 | `redis_get` / `redis_scan` / `redis_type` 等 | 读取 string/hash/list/set/zset、遍历 key 与查询元信息。 |
 | `redis_set` / `redis_del` / `redis_expire` 等 | 在 write 实例上写入、删除、修改集合与过期时间。 |
 
-每个实例使用 `permissions: read` 或 `write`，默认 `read`。SQL 每次只允许一条语句；高危 `DROP`/`TRUNCATE`/`ALTER` 需要 `confirm=true`。查询默认最多返回 1000 行、50000 个结果字符；大数据集优先用 `redis_scan`。SQL 词法分析不能判断任意存储过程的内部行为，只读事务是数据库侧的兜底。网络错误后的重试不保证写操作仅执行一次。
+每个实例使用 `permissions: read` 或 `write`，默认 `read`。SQL 每次只允许一条语句；高危 `DROP`/`TRUNCATE`/`ALTER` 需要 `confirm=true`。查询默认最多返回 1000 行、50000 个结果字符；大数据集优先用 `redis_scan`；`COUNT` 是扫描提示，每页可能为空，应继续使用返回游标直到其为 `0`。SQL 词法分析不能判断任意存储过程的内部行为，只读事务是数据库侧的兜底。网络错误后的重试不保证写操作仅执行一次。
 
 ## 人员、凭证与审计
 
 - 网页使用用户名/密码、HttpOnly Cookie 会话与 CSRF 校验；所有启用人员同权。
 - 后台统一管理全部工作空间和资源。每个数据库实例只创建一次，可归属多个项目；留空时任何 MCP token 都无法访问。每枚 token 创建时必须单选空间，归属固定。移除资源的项目归属后，该项目已有 MCP 会话的后续调用也会被拒绝。
 - 工作空间仍关联资源或未删除的 token（含停用 token）时，删除会被拒绝。修改共享资源的连接配置影响所有使用它的项目。
-- MCP token 与人员账号独立：当前源码新建的 token 支持列表复制，接入提供 Claude Code 与 Codex 两种示例。服务保存验证哈希和加密副本，列表仅返回元数据；原有仅哈希的 token 无法恢复，需新建才能复制。token 仅用于 `/mcp`，不能登录网页。
-
-- 当前源码的 Token 创建与编辑可设置到期时间，留空长期有效；时间按浏览器时区输入。到期后停止新的 MCP 请求与调用，人员仍可复制或调整期限；复制不会自动恢复权限。重启与升级保留原期限，已删除 Token 不能复活。
-- 用户名、显示名和 Token 名称上限128个 Unicode 字符，Token 备注上限1000；登录和编辑使用相同边界。
+- MCP Token 与人员账号独立：新建的 Token 支持列表复制，接入提供 Claude Code 与 Codex 两种示例。服务保存验证哈希和加密副本，列表仅返回元数据；原有仅哈希的 token 无法恢复，需新建才能复制。token 仅用于 `/mcp`，不能登录网页。
+- Token 创建与编辑可设置到期时间，留空长期有效；时间按浏览器时区输入。到期后停止新的 MCP 请求与调用，人员仍可复制或调整期限；复制不会自动恢复权限。重启与升级保留原期限，已删除 Token 不能复活。
+- 用户名、显示名和 Token 名称上限 128 个 Unicode 字符，Token 备注上限 1000 个字符；登录和编辑使用相同边界。
 - 重启、升级或重建容器保留有效 token；创建新 token、停用或删除创建者不会自动吊销旧 token。密码修改、人员停用或删除会撤销该人员会话。成员开关直接保存，删除须确认，至少保留一个启用成员；有其他启用成员时可禁用或删除自己，随后退出登录。
 - Token 开关直接启停；确认删除后永久失效并从管理列表移除，保留失效标记与历史审计。
 - 人员审计记录登录与配置变更；MCP 审计记录 token、实际实例类型/主机/端口/数据库/连接账号及 SQL 或 Redis 操作、结果和耗时。默认保留 30 天，可筛选、查看详情与导出 CSV。
@@ -205,7 +265,7 @@ docker compose down
 
 ### 备份与更新
 
-先停止服务再备份完整目录，包含 SQLite 的 WAL/SHM 文件与 `data/service.token.key`；使用 SQLite 在线备份时也要保存匹配的加密密钥。密钥丢失或损坏会阻止复制和新签发，已有哈希认证继续独立工作。
+先停止服务再备份完整目录，包含 SQLite 的 WAL/SHM 文件与 `data/service.token.key`；使用 SQLite 在线备份时也要保存匹配的加密密钥。密钥丢失或损坏会阻止复制和新签发，已有哈希认证继续独立工作。恢复密钥文件后，服务会将其权限收紧为 `0600`，请保留普通文件及正确属主。
 
 ```bash
 mkdir -p backups
@@ -213,6 +273,8 @@ docker compose stop
 (umask 077; tar -czf "backups/runtime-$(date +%Y%m%d-%H%M%S).tar.gz" runtime .env docker-compose.yml)
 docker compose start
 ```
+
+使用源码构建的 `dev` 镜像时，更新源码后重新执行前面的 `build` 与 `up -d`，保留原 `.env` 和 `runtime/`。下面的拉取命令适用于已发布镜像。
 
 修改 `.env` 中的 `DBMCP_IMAGE` 为已发布的新版本后执行：
 
@@ -247,26 +309,11 @@ location /db-mcp/ {
 | 远程浏览器无法打开页面 | 默认仅本机监听；使用 HTTPS 反代、SSH 隧道，或显式修改绑定地址。 |
 | 网页登录后 MCP 仍认证失败 | 网页账号与 MCP token 分开管理，在 MCP Token 页面创建专用凭证。 |
 | 容器连不上资源 | 检查容器网络、目标地址与防火墙，避免误用容器自己的 `127.0.0.1`。 |
-| 首次安装如何登录 | 当前源码首次启动无用户时自动创建 `admin / admin`；已有用户时使用原账号密码。 |
+| 首次安装如何登录 | 当前 dev 首次启动无用户时使用 `admin / admin`；已有用户使用原凭据，旧镜像按其初始化提示操作。 |
 
 ## 其他启动方式
 
-三种方式都提供完整 HTTP MCP 服务与管理界面。
-
-<details>
-<summary>源码 + uv</summary>
-
-Python 3.10+ 与 uv；完整兼容性以锁文件与实际运行环境为准。
-
-```bash
-uv sync --locked
-uv run --locked db-mcp --init --config ./runtime/config.yaml
-uv run --locked db-mcp --config ./runtime/config.yaml
-```
-
-CLI 支持 `--host`、`--port`、`--config`、`--data-dir`。`--data-dir` 相对启动目录解析，只覆盖路径，不自动移动已有数据。
-
-</details>
+源码、Docker 与 Python 包共用完整 HTTP MCP 服务及管理页面。下面演示从当前源码构建本地安装包。
 
 <details>
 <summary>Python 包 / uvx</summary>
@@ -286,6 +333,8 @@ wheel/sdist 包含默认配置和管理页面；也可 `uv tool install` 安装�
 ## 开发与项目
 
 管理页面统一采用 **Ant Design 6 控制台**：OPPO Sans 4.0、原生浅深主题、56px 顶栏与 220px/64px 可折叠侧栏。一级菜单直接展示内容，不重复菜单标题；所有列表表头与正文居中，默认不吸顶，分页为 10/20/50、默认 10。主题默认浅色，仅在顶栏切换。公共组件、字体原件与许可、依赖和静态产物均由服务独立持有。具体布局、交互和验证约定见[开发指引](CLAUDE.md)。本地源码和构建产物的迁移不代表已发布镜像更新。
+
+字体文件与授权原文随服务交付，见 [OPPO Sans Fonts License Agreement](webui/public/assets/fonts/OPPO-Sans-LICENSE.txt)。
 
 ```bash
 uv sync --locked
